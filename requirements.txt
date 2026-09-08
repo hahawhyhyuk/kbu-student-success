@@ -1,0 +1,10 @@
+streamlit
+pandas
+openpyxl
+numpy
+plotly
+pyyaml
+pytest
+jsonschema
+scikit-learn
+sentence-transformers

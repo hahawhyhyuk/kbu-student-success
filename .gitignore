@@ -1,0 +1,11 @@
+.env
+database/*.db
+database/backups/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.streamlit/secrets.toml
+data/private/
+data/master_backups/
+.DS_Store

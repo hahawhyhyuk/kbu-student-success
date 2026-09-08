@@ -1,0 +1,2 @@
+student_id,week,attendance_rate,absence_count,consecutive_absence,late_count,assignment_submission_rate,overdue_assignment_count,lms_login_days,lms_activity_change,video_completion_rate,quiz_score,major_interest,major_satisfaction,major_continuation_intent,career_clarity,learning_difficulty,consultation_intent,interest_fields,desired_job,natural_language_concern,observation_note
+S0003,15,92.00,1,0,1,86.00,1,4,8.00,82.00,76.00,4,4,4,4,2,2,서비스|보건,헬스케어 서비스 기획,상담 후 출석과 과제 흐름을 회복했고 전공과 진로 방향도 구체화하고 있습니다.,상담 완료 후 15주차 synthetic 후속 관찰 · 실제 학생 성과가 아님

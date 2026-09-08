@@ -1,0 +1,115 @@
+risk_levels:
+  normal_max: 24
+  attention_max: 44
+  caution_max: 64
+
+risk_types:
+  secondary_min: 60
+  complex_min: 65
+  complex_domain_count: 2
+
+weights:
+  attendance: 0.25
+  engagement: 0.20
+  achievement: 0.20
+  major_adaptation: 0.20
+  career: 0.15
+
+attendance:
+  rate_bands:
+    - {min: 95, score: 0}
+    - {min: 90, score: 20}
+    - {min: 85, score: 40}
+    - {min: 80, score: 65}
+    - {min: 0, score: 90}
+  consecutive_absence_bonuses:
+    - {min: 3, score: 10}
+    - {min: 2, score: 5}
+    - {min: 0, score: 0}
+  missing_defaults:
+    attendance_rate: 95
+    consecutive_absence: 0
+
+engagement:
+  weights:
+    assignment_submission_rate: 0.35
+    lms_login_days: 0.25
+    video_completion_rate: 0.20
+    lms_activity_change: 0.20
+  assignment_submission_rate_bands:
+    - {min: 95, score: 0}
+    - {min: 85, score: 20}
+    - {min: 70, score: 50}
+    - {min: 50, score: 75}
+    - {min: 0, score: 100}
+  lms_login_days_bands:
+    - {min: 5, score: 0}
+    - {min: 4, score: 20}
+    - {min: 3, score: 45}
+    - {min: 2, score: 70}
+    - {min: 0, score: 100}
+  video_completion_rate_bands:
+    - {min: 90, score: 0}
+    - {min: 75, score: 25}
+    - {min: 60, score: 50}
+    - {min: 40, score: 75}
+    - {min: 0, score: 100}
+  lms_activity_change_bands:
+    - {min: 0, score: 0}
+    - {min: -10, score: 20}
+    - {min: -25, score: 50}
+    - {min: -40, score: 75}
+    - {min: -100, score: 100}
+  missing_defaults:
+    assignment_submission_rate: 90
+    lms_login_days: 4
+    video_completion_rate: 85
+    lms_activity_change: 0
+
+achievement:
+  weights:
+    previous_gpa: 0.40
+    quiz_score: 0.30
+    repeat_course_count: 0.15
+    academic_warning_history: 0.15
+  previous_gpa_bands:
+    - {min: 4.0, score: 0}
+    - {min: 3.5, score: 15}
+    - {min: 3.0, score: 30}
+    - {min: 2.5, score: 50}
+    - {min: 2.0, score: 70}
+    - {min: 0, score: 90}
+  quiz_score_bands:
+    - {min: 90, score: 0}
+    - {min: 80, score: 20}
+    - {min: 70, score: 40}
+    - {min: 60, score: 65}
+    - {min: 0, score: 90}
+  repeat_course_count_bands:
+    - {min: 3, score: 80}
+    - {min: 2, score: 50}
+    - {min: 1, score: 25}
+    - {min: 0, score: 0}
+  academic_warning_history_bands:
+    - {min: 2, score: 100}
+    - {min: 1, score: 50}
+    - {min: 0, score: 0}
+  missing_defaults:
+    previous_gpa: 3.0
+    quiz_score: 75
+    repeat_course_count: 0
+    academic_warning_history: 0
+
+likert_risk_map:
+  1: 100
+  2: 75
+  3: 50
+  4: 25
+  5: 0
+
+major_adaptation:
+  missing_default: 3
+
+career:
+  missing_default: 3
+  missing_desired_job_bonus: 10

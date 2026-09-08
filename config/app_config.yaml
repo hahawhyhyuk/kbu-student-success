@@ -1,0 +1,139 @@
+ai:
+  provider: auto
+  gemini_model: gemini-3.5-flash-lite
+  api_key_env: GEMINI_API_KEY
+  timeout_seconds: 20
+
+ui:
+  ai_reveal:
+    enabled: true
+    words_per_chunk: 2
+    delay_seconds: 0.04
+
+departments:
+  - code: DEPT01
+    name: 친환경건축과
+  - code: DEPT02
+    name: 유아교육과
+  - code: DEPT03
+    name: 실용음악과(3년제)
+  - code: DEPT04
+    name: 간호학과
+  - code: DEPT05
+    name: 소프트웨어융합과
+
+data:
+  department_master_file: departments_master.csv
+  support_program_master_file: support_programs_wings.csv
+  support_program_fallback_file: support_programs.csv
+  course_master_file: courses_reviewed.csv
+  course_fallback_file: courses.csv
+
+recommendation:
+  top_k: 3
+  weights:
+    risk_type_match: 0.55
+    semantic_similarity: 0.30
+    support_need_match: 0.15
+  similarity:
+    prefer_sentence_transformers: true
+    sentence_transformer_model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+    local_files_only: true
+
+course_recommendation:
+  top_k: 4
+  minimum_courses: 3
+  candidate_pool_size: 20
+  diversity_bonus: 0.08
+  department_policy:
+    allow_cross_department: true
+    home_department_bonus: 0.08
+    minimum_home_department_courses: 1
+  source_backed_policy:
+    home_department_bonus: 0.03
+    candidate_pool_size: 80
+    maximum_cross_department_courses: 2
+    max_general_education_courses: 1
+    max_same_name_family: 1
+  weights:
+    semantic_similarity: 0.40
+    interest_match: 0.20
+    job_match: 0.15
+    competency_coverage: 0.15
+    feasibility: 0.10
+
+intervention_management:
+  statuses:
+    - 추천 생성
+    - 교직원 검토 대기
+    - 교직원 검토
+    - 지원계획 작성
+    - 연락 전
+    - 상담 예정
+    - 상담 완료
+    - 프로그램 참여
+    - 학생 거절
+    - 추후 관찰
+  feedback_types:
+    - 관심 있음
+    - 나중에 보기
+    - 관심 없음
+    - 추천 이유가 맞지 않음
+    - 다른 분야 추천 희망
+  next_actions:
+    - 전화 안내
+    - 상담 일정 조율
+    - 프로그램 신청 연결
+    - 담당 부서 연계
+    - 후속 체크인 요청
+  plan_item_statuses:
+    - 지원 예정
+    - 연락 완료
+    - 상담 연결
+    - 신청 안내
+    - 참여 중
+    - 지원 완료
+    - 학생 미희망
+
+dashboard:
+  unaddressed_intervention_statuses:
+    - 추천 생성
+    - 교직원 검토 대기
+    - 교직원 검토
+    - 지원계획 작성
+    - 연락 전
+  unaddressed_display_limit: 30
+
+intervention_effect:
+  meaningful_change_threshold: 5.0
+  score_change_epsilon: 0.01
+
+demo:
+  enabled: true
+  representative_student_id: S0003
+  baseline_week: 4
+  observation_weeks: [1, 2, 3, 4]
+  followup:
+    enabled: true
+    week: 15
+    file: demo_followup_observations.csv
+    eligible_intervention_statuses:
+      - 상담 완료
+      - 프로그램 참여
+      - 추후 관찰
+  reset_confirmation_text: 시연 기록 초기화
+  department_course_tracks:
+    DEPT01: service
+    DEPT02: counseling_welfare
+    DEPT03: content_design
+    DEPT04: health
+    DEPT05: data_ai
+
+microdegree_candidate:
+  target_risk_min: 60
+  minimum_students: 3
+  minimum_departments: 2
+  single_department_minimum_students: 5
+  repeated_course_count: 2
+  common_item_min_ratio: 0.35
+  candidate_course_count: 4

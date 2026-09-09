@@ -327,7 +327,11 @@ def test_gemini_chat_uses_persona_and_validated_anonymous_state(
         return FakeHttpResponse(api_payload)
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-    result = GeminiProvider(api_key="test-key").generate_kare_reply(
+    result = GeminiProvider(
+        api_key="test-key",
+        timeout_seconds=20,
+        kare_timeout_seconds=35,
+    ).generate_kare_reply(
         history=[{"role": "assistant", "content": "편하게 이야기해 주세요."}],
         user_message="요즘 과제가 자꾸 밀려서 걱정이에요.",
         semantic_state=empty_semantic_state(),
@@ -337,6 +341,7 @@ def test_gemini_chat_uses_persona_and_validated_anonymous_state(
     )
 
     assert validate_kare_chat_reply(result) == expected
+    assert captured_request["timeout"] == 35
     request_payload = captured_request["payload"]
     assert "systemInstruction" in request_payload
     serialized_payload = json.dumps(request_payload, ensure_ascii=False)

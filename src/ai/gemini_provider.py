@@ -49,12 +49,18 @@ class GeminiProvider(AIProvider):
         api_key: str,
         model: str = "gemini-3.5-flash-lite",
         timeout_seconds: int = 20,
+        kare_timeout_seconds: int | None = None,
     ) -> None:
         if not str(api_key).strip():
             raise ValueError("Gemini API key가 필요합니다.")
         self.api_key = str(api_key).strip()
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.kare_timeout_seconds = (
+            int(kare_timeout_seconds)
+            if kare_timeout_seconds is not None
+            else int(timeout_seconds)
+        )
 
     def analyze_checkin(self, text: str) -> dict[str, Any]:
         """학생 자유서술을 Gemini structured JSON으로 변환하고 검증한다."""
@@ -177,6 +183,7 @@ class GeminiProvider(AIProvider):
             system_instruction=KARE_SYSTEM_INSTRUCTION,
             temperature=0.45,
             operation_label="Kare 대화 생성",
+            timeout_seconds=self.kare_timeout_seconds,
         )
         return validate_kare_chat_reply(parsed)
 

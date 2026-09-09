@@ -28,5 +28,11 @@ def create_ai_provider(
         api_key=str(key),
         model=str(ai_config["gemini_model"]),
         timeout_seconds=int(ai_config["timeout_seconds"]),
+        kare_timeout_seconds=int(
+            ai_config.get(
+                "kare_timeout_seconds",
+                ai_config["timeout_seconds"],
+            )
+        ),
     )
     return ResilientAIProvider(primary=primary, fallback=fallback)

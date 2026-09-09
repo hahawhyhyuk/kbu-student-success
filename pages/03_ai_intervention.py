@@ -14,8 +14,16 @@ from src.checkin_service import CheckinAnalysisResult, CheckinAnalysisService
 from src.course_catalog_presenter import format_course_caption
 from src.course_recommender import CourseRecommender
 from src.intervention_recommender import InterventionRecommender, RecommendationResult
-from src.intervention_service import InterventionContext, InterventionManagementService
-from src.learning_path_builder import LearningPathBuilder, LearningPathResult
+from src.intervention_service import (
+    COURSE_REVIEW_JUDGMENTS,
+    InterventionContext,
+    InterventionManagementService,
+)
+from src.learning_path_builder import (
+    LearningPathBuilder,
+    LearningPathResult,
+    ordered_courses_by_sequence,
+)
 from src.repositories import get_default_repository
 from src.risk_service import (
     create_integrated_risk_service,
@@ -157,7 +165,9 @@ def _render_generated_course_cards(
         for item in result.explanation["course_roles"]
     }
     master_ids = set(courses["course_id"].astype(str))
-    for course in result.selection.courses:
+    for course in ordered_courses_by_sequence(
+        result.selection, result.explanation
+    ):
         if course.course_id not in master_ids or course.course_id in completed_ids:
             continue
         role = role_by_id[course.course_id]
@@ -236,7 +246,7 @@ completed_ids = set(
 )
 
 active_section = render_submenu(
-    ("학생 · AI 이해", "비교과 추천", "교과 학습경로", "통합 승인", "학생 피드백"),
+    ("학생 · AI 이해", "비교과 추천", "교과 학습경로", "최종 검토", "학생 피드백"),
     key="integrated_recommendation_submenu",
 )
 info_columns = st.columns(4)
@@ -546,7 +556,12 @@ if analysis is not None and intervention_id is not None and recommendation_rows:
                                 submitted_checkin.get("natural_language_concern", "")
                             )
                             result, _ = path_service.build_and_store_learning_path(
-                                selected_student_id, latest_profile, analysis, source
+                                selected_student_id,
+                                latest_profile,
+                                analysis,
+                                source,
+                                generation_version=generation_version,
+                                create_new_version=generation_version > 1,
                             )
                             st.session_state[course_result_key] = result
                             queue_ai_reveal(
@@ -571,6 +586,7 @@ if analysis is not None and intervention_id is not None and recommendation_rows:
             review_status = str(path.get("review_status") or "검토 대기")
             st.caption(
                 f"체크인 #{int(path['source_checkin_id'])} 저장 결과 · "
+                f"추천 버전: v{int(path.get('generation_version') or 1)} · "
                 f"설명 provider: {path.get('provider_name') or '기록 없음'} · "
                 f"검토 상태: {review_status}"
             )
@@ -628,11 +644,20 @@ if analysis is not None and intervention_id is not None and recommendation_rows:
             _render_generated_course_cards(result, courses, completed_ids)
             st.info(
                 "이 경로는 학생 제출 체크인과 연결되지 않은 수동 조회 결과입니다. "
-                "통합 승인은 비교과 추천에만 기록됩니다."
+                "최종 검토 결과는 비교과 추천에만 기록됩니다."
             )
 
-    elif active_section == "통합 승인":
-        st.subheader("비교과·교과 통합 승인")
+    elif active_section == "최종 검토":
+        st.subheader("추천 최종 검토")
+        review_notice_key = f"integrated_review_notice_{selected_student_id}"
+        review_notice = st.session_state.pop(review_notice_key, None)
+        if review_notice:
+            notice_type = str(review_notice.get("type") or "success")
+            notice_message = str(review_notice.get("message") or "")
+            if notice_type == "warning":
+                st.warning(notice_message)
+            else:
+                st.success(notice_message)
         readiness_columns = st.columns(3)
         readiness_columns[0].metric("비교과 추천", f"{len(recommendation_rows)}개")
         readiness_columns[1].metric(
@@ -643,62 +668,294 @@ if analysis is not None and intervention_id is not None and recommendation_rows:
         current_status = (
             str(current_intervention["status"]) if current_intervention is not None else "기록 확인 필요"
         )
+        current_staff_action = (
+            str(current_intervention.get("staff_action") or "")
+            if current_intervention is not None
+            else ""
+        )
         current_path_status = (
             str(stored_path.iloc[0].get("review_status") or "검토 대기")
             if not stored_path.empty
             else "경로 없음"
         )
-        with readiness_columns[2]:
-            with st.container(border=True, key="integrated_review_status_card"):
-                st.caption("현재 검토")
-                st.markdown(f"**비교과**  \n{current_status}")
-                st.markdown(f"**교과**  \n{current_path_status}")
+        program_decision_by_action = {
+            "추천 검토 승인": "승인",
+            "추천 조정 필요": "조정 필요",
+            "보류": "보류",
+        }
+        current_program_decision = program_decision_by_action.get(
+            current_staff_action,
+            "판단 전",
+        )
+        current_course_decision = (
+            current_path_status
+            if current_path_status in {"승인", "조정 필요", "보류"}
+            else "판단 전"
+        )
+        readiness_columns[2].metric("추천 버전", f"v{generation_version}")
+        st.caption(
+            f"현재 검토 · 비교과 {current_program_decision} · "
+            f"교과 {current_course_decision} · 지원 진행 {current_status}"
+        )
         if stored_path.empty:
             st.info(
                 "이 체크인에 저장된 교과 학습경로가 없습니다. "
                 "현재 검토 결과는 비교과 추천에만 저장됩니다."
             )
-        review_note = st.text_area(
-            "통합 검토 메모",
-            placeholder=(
-                "비교과 연결 조건, 교과목 수강 가능 여부 등 확인 내용을 남겨주세요. "
-                "'조정 필요'를 선택할 때는 바꿀 프로그램·과목과 이유를 적어주세요."
-            ),
+
+        decision_options = ("판단 전", "승인", "조정 필요", "보류")
+        program_note_default = (
+            str(current_intervention.get("staff_note") or "")
+            if current_intervention is not None
+            else ""
         )
-        st.caption(
-            "‘조정 필요’는 비교과·교과에 검토 상태와 메모를 함께 저장합니다. "
-            "추천을 자동으로 다시 생성하지는 않습니다."
+        path_note_default = (
+            str(stored_path.iloc[0].get("review_note") or "")
+            if not stored_path.empty
+            else ""
         )
-        action_columns = st.columns(3)
-        selected_action: str | None = None
-        action_labels = {
-            "승인": "통합 승인",
-            "수정": "조정 필요로 저장",
-            "보류": "검토 보류",
-        }
-        for column, action in zip(action_columns, ("승인", "수정", "보류")):
-            button_label = action_labels[action]
-            if column.button(
-                button_label,
-                key=f"integrated_{action}_{selected_student_id}_{intervention_id}",
-                type="primary" if action == "승인" else "secondary",
-            ):
-                selected_action = action
-        if selected_action is not None:
-            if selected_action == "수정" and not review_note.strip():
-                st.error("조정이 필요한 프로그램·과목과 이유를 검토 메모에 적어주세요.")
+        course_judgments: dict[str, str] = {}
+        with st.form(
+            f"separate_review_form_{selected_student_id}_{intervention_id}_{generation_version}"
+        ):
+            program_column, course_column = st.columns(2, gap="large")
+            with program_column:
+                st.markdown("#### 비교과 추천")
+                st.caption(
+                    f"추천 {len(recommendation_rows)}개를 확인하고 연결 여부를 판단합니다."
+                )
+                program_decision = st.radio(
+                    "비교과 판단",
+                    decision_options,
+                    index=decision_options.index(current_program_decision),
+                    horizontal=True,
+                    key=f"program_decision_{selected_student_id}_{generation_version}",
+                )
+                program_note = st.text_area(
+                    "비교과 검토 메모",
+                    value=program_note_default,
+                    placeholder="연결 조건이나 교체할 프로그램과 이유를 남겨주세요.",
+                    key=f"program_review_note_{selected_student_id}_{generation_version}",
+                )
+            with course_column:
+                st.markdown("#### 교과 학습경로")
+                if stored_path.empty:
+                    course_decision = None
+                    course_note = ""
+                    st.caption("저장된 교과 학습경로가 없습니다.")
+                else:
+                    st.caption(
+                        "각 과목의 연결성을 먼저 판정한 뒤 경로 전체를 판단합니다."
+                    )
+                    course_decision = st.radio(
+                        "교과 판단",
+                        decision_options,
+                        index=decision_options.index(current_course_decision),
+                        horizontal=True,
+                        key=f"course_decision_{selected_student_id}_{generation_version}",
+                    )
+                    course_names = (
+                        courses.set_index("course_id")["course_name"]
+                        .astype(str)
+                        .to_dict()
+                    )
+                    path_courses = stored_path.sort_values("sequence").drop_duplicates(
+                        "course_id"
+                    )
+                    for path_course in path_courses.to_dict(orient="records"):
+                        course_id = str(path_course["course_id"])
+                        stored_judgment = str(
+                            path_course.get("review_judgment") or "판단 전"
+                        )
+                        if stored_judgment not in COURSE_REVIEW_JUDGMENTS:
+                            stored_judgment = "판단 전"
+                        course_judgments[course_id] = st.selectbox(
+                            f"{course_names.get(course_id, course_id)} 적절성",
+                            COURSE_REVIEW_JUDGMENTS,
+                            index=COURSE_REVIEW_JUDGMENTS.index(stored_judgment),
+                            key=(
+                                f"course_judgment_{selected_student_id}_"
+                                f"{generation_version}_{course_id}"
+                            ),
+                        )
+                    course_note = st.text_area(
+                        "교과 검토 메모",
+                        value=path_note_default,
+                        placeholder="수강 가능 여부나 교체할 과목과 이유를 남겨주세요.",
+                        key=f"course_review_note_{selected_student_id}_{generation_version}",
+                    )
+            save_column, hold_column = st.columns(2)
+            save_review = save_column.form_submit_button(
+                "검토 결과 저장",
+                type="primary",
+                use_container_width=True,
+            )
+            hold_all = hold_column.form_submit_button(
+                "전체 보류",
+                use_container_width=True,
+            )
+
+        if save_review or hold_all:
+            selected_program_decision = "보류" if hold_all else program_decision
+            selected_course_decision = (
+                "보류" if hold_all and course_decision is not None else course_decision
+            )
+            if selected_program_decision == "판단 전":
+                st.error("비교과 추천의 검토 판단을 선택해 주세요.")
+            elif selected_course_decision == "판단 전":
+                st.error("교과 학습경로의 검토 판단을 선택해 주세요.")
             else:
-                path_updated = intervention_service.apply_integrated_review_action(
-                    intervention_id, selected_action, review_note
+                try:
+                    path_updated = intervention_service.apply_separate_review_actions(
+                        intervention_id=intervention_id,
+                        program_decision=selected_program_decision,
+                        program_note=program_note,
+                        course_decision=selected_course_decision,
+                        course_note=course_note,
+                        course_judgments=course_judgments,
+                    )
+                    included_scope = (
+                        "비교과와 교과의 독립 검토" if path_updated else "비교과 검토"
+                    )
+                    st.session_state[review_notice_key] = {
+                        "type": "success",
+                        "message": f"{included_scope} 결과를 저장했습니다.",
+                    }
+                    st.rerun()
+                except ValueError as error:
+                    st.error(str(error))
+
+        if (
+            (
+                current_staff_action == "추천 조정 필요"
+                or current_path_status == "조정 필요"
+            )
+            and submitted_checkin is not None
+        ):
+            st.divider()
+            st.markdown("#### 추천 다시 만들기")
+            st.caption(
+                "교체할 현재 추천을 직접 선택하면 해당 항목을 제외하고 "
+                f"현재 master에서 v{generation_version + 1}을 다시 계산합니다. "
+                f"기존 v{generation_version} 결과와 검토 메모는 이력으로 보존됩니다."
+            )
+            excluded_program_ids: list[str] = []
+            if current_staff_action == "추천 조정 필요":
+                program_names = {
+                    str(item["program_id"]): str(item["program_name"])
+                    for item in recommendation_rows
+                }
+                excluded_program_ids = st.multiselect(
+                    "교체할 비교과 추천",
+                    options=list(program_names),
+                    format_func=lambda program_id: program_names[program_id],
+                    placeholder="기존 추천 중 제외할 항목 선택",
+                    key=f"excluded_programs_{selected_student_id}_{generation_version}",
                 )
-                included_scope = (
-                    "비교과 추천과 교과 학습경로" if path_updated else "비교과 추천"
+            else:
+                st.caption("비교과는 조정 요청이 없어 현재 추천을 유지합니다.")
+            excluded_course_ids: list[str] = []
+            if not stored_path.empty and current_path_status == "조정 필요":
+                course_names = courses.set_index("course_id")["course_name"].astype(str).to_dict()
+                path_course_ids = list(
+                    dict.fromkeys(stored_path["course_id"].astype(str).tolist())
                 )
-                st.success(
-                    f"{included_scope}의 '{action_labels[selected_action]}' 결과를 저장했습니다."
+                default_excluded_course_ids = list(
+                    dict.fromkeys(
+                        stored_path[
+                            stored_path["review_judgment"] == "부적절"
+                        ]["course_id"].astype(str).tolist()
+                    )
                 )
+                excluded_course_ids = st.multiselect(
+                    "교체할 교과목",
+                    options=path_course_ids,
+                    default=default_excluded_course_ids,
+                    format_func=lambda course_id: course_names.get(course_id, course_id),
+                    placeholder="기존 학습경로 중 제외할 교과목 선택",
+                    key=f"excluded_courses_{selected_student_id}_{generation_version}",
+                )
+            elif stored_path.empty:
+                st.caption("저장된 교과 학습경로가 없어 비교과만 다시 만듭니다.")
+            else:
+                st.caption("교과는 조정 요청이 없어 현재 학습경로를 유지합니다.")
+            st.caption(
+                "검토 메모는 감사 이력으로만 보존하며 AI 명령으로 해석하지 않습니다. "
+                "후보 선정은 제외 항목을 뺀 실제 DB 데이터로 다시 수행합니다."
+            )
+            regenerate_clicked = st.button(
+                "선택 항목 제외하고 추천 다시 만들기",
+                type="primary",
+                disabled=not (excluded_program_ids or excluded_course_ids),
+                key=f"regenerate_recommendations_{selected_student_id}_{generation_version}",
+            )
+            if regenerate_clicked:
+                with st.spinner("실제 DB 후보를 다시 검색하고 새 버전을 저장하고 있습니다..."):
+                    try:
+                        repository = get_default_repository()
+                        source = repository.get_all()
+                        provider = create_ai_provider(api_key=resolve_gemini_api_key())
+                        regeneration_service = StudentViewService(
+                            repository=repository,
+                            ai_provider=provider,
+                            program_recommender=get_program_recommender(),
+                            course_recommender=get_course_recommender(),
+                        )
+                        latest_profile = latest.to_dict()
+                        latest_profile["student_checkin_id"] = int(
+                            submitted_checkin["checkin_id"]
+                        )
+                        latest_profile["interest_fields"] = "|".join(
+                            submitted_checkin.get("interest_fields", [])
+                        )
+                        latest_profile["desired_job"] = str(
+                            submitted_checkin.get("desired_job", "")
+                        )
+                        latest_profile["natural_language_concern"] = str(
+                            submitted_checkin.get("natural_language_concern", "")
+                        )
+                        regeneration = regeneration_service.regenerate_recommendations(
+                            selected_student_id,
+                            latest_profile,
+                            analysis,
+                            source,
+                            excluded_program_ids=excluded_program_ids,
+                            excluded_course_ids=excluded_course_ids,
+                        )
+                        st.session_state.pop(program_result_key, None)
+                        st.session_state.pop(course_result_key, None)
+                        if regeneration.learning_path_error:
+                            notice_type = "warning"
+                            notice_message = (
+                                f"v{regeneration.intervention_context.generation_version} "
+                                "비교과 추천은 저장했지만 교과 학습경로는 "
+                                f"생성하지 못했습니다: {regeneration.learning_path_error}"
+                            )
+                        else:
+                            notice_type = "success"
+                            preserved_scopes = []
+                            if regeneration.program_recommendations_preserved:
+                                preserved_scopes.append("비교과")
+                            if regeneration.learning_path_preserved:
+                                preserved_scopes.append("교과")
+                            preserved_text = (
+                                f" {'·'.join(preserved_scopes)} 결과는 그대로 유지했습니다."
+                                if preserved_scopes
+                                else ""
+                            )
+                            notice_message = (
+                                f"v{regeneration.intervention_context.generation_version} 추천을 "
+                                f"저장했습니다.{preserved_text} 조정한 영역은 다시 검토해 주세요."
+                            )
+                        st.session_state[review_notice_key] = {
+                            "type": notice_type,
+                            "message": notice_message,
+                        }
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"추천을 다시 만들지 못했습니다: {error}")
         st.caption(
-            "승인·조정 필요·보류는 추천 검토 결과를 저장합니다. 실제 지원할 비교과 "
+            "비교과와 교과의 판단은 독립적으로 저장됩니다. 실제 지원할 비교과 "
             "프로그램·담당자·연락 예정일은 `학생지원 진행 관리`에서 확정합니다. "
             "교과목은 실제 개설·수강 가능 여부를 학사정보로 최종 확인해야 합니다."
         )

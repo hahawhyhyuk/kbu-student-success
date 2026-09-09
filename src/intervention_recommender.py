@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
+from src.recommendation_interest import (
+    infer_interest_evidence,
+    supported_interest_labels,
+)
 from src.similarity import (
     ResilientSimilarityBackend,
     SimilarityBackend,
     create_similarity_backend,
 )
-from src.utils import load_app_config
+from src.utils import load_app_config, load_risk_config
 
 
 DOMAIN_LABELS = {
@@ -29,6 +34,28 @@ SUPPORT_NEED_TERMS = {
     "진로 탐색": ("진로", "직무", "목표"),
     "정기 모니터링": ("상담", "코칭", "점검"),
 }
+SUPPORT_NEED_ALIASES = (
+    (
+        ("출결", "결석", "출석", "등교", "지각", "시간 관리", "시간관리"),
+        ("출결", "결석", "출석", "등교", "시간관리", "학업지속", "주간계획"),
+    ),
+    (
+        ("학습", "학업", "과제", "수업", "진도", "암기", "공부"),
+        SUPPORT_NEED_TERMS["학습 지원"],
+    ),
+    (
+        ("전공", "적성"),
+        SUPPORT_NEED_TERMS["전공 탐색"],
+    ),
+    (
+        ("진로", "직무", "취업"),
+        SUPPORT_NEED_TERMS["진로 탐색"],
+    ),
+    (
+        ("상담", "정서", "스트레스", "마음", "모니터링"),
+        SUPPORT_NEED_TERMS["정기 모니터링"],
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -61,20 +88,24 @@ class InterventionRecommender:
         self,
         similarity_backend: SimilarityBackend | None = None,
         config: Mapping[str, Any] | None = None,
+        risk_config: Mapping[str, Any] | None = None,
     ) -> None:
         self.config = config or load_app_config()
+        self.risk_config = risk_config if risk_config is not None else load_risk_config()
         self.similarity_backend = similarity_backend or create_similarity_backend(
             self.config
         )
 
-    @staticmethod
-    def _active_risk_domains(profile: Mapping[str, Any]) -> set[str]:
+    def _active_risk_domains(self, profile: Mapping[str, Any]) -> set[str]:
+        """주 위험과 YAML의 보조 위험 기준을 충족한 영역을 추천에 사용한다."""
+
         scores = {
             domain: float(profile.get(f"{domain}_risk", 0) or 0)
             for domain in DOMAIN_LABELS
             if domain != "complex"
         }
-        active = {domain for domain, score in scores.items() if score >= 60}
+        threshold = float(self.risk_config["risk_types"]["secondary_min"])
+        active = {domain for domain, score in scores.items() if score >= threshold}
         if scores:
             active.add(max(scores, key=scores.get))
         if bool(profile.get("is_complex", False)):
@@ -118,10 +149,83 @@ class InterventionRecommender:
         normalized_program = program_text.replace(" ", "")
         matched = 0
         for need in support_needs:
-            terms = SUPPORT_NEED_TERMS.get(str(need), (str(need),))
+            need_text = str(need).strip()
+            terms = SUPPORT_NEED_TERMS.get(need_text)
+            if terms is None:
+                normalized_need = need_text.replace(" ", "")
+                terms = next(
+                    (
+                        program_terms
+                        for aliases, program_terms in SUPPORT_NEED_ALIASES
+                        if any(
+                            alias.replace(" ", "") in normalized_need
+                            for alias in aliases
+                        )
+                    ),
+                    (need_text,),
+                )
             if any(term.replace(" ", "") in normalized_program for term in terms):
                 matched += 1
         return matched / len(support_needs)
+
+    @staticmethod
+    def _profile_interests(
+        profile: Mapping[str, Any], analysis: Mapping[str, Any]
+    ) -> set[str]:
+        """학생이 명시한 값과 검증된 분석에서 지원 분야만 반환한다."""
+
+        profile_interests = {
+            item.strip()
+            for item in str(profile.get("interest_fields", "")).split("|")
+            if item.strip()
+        }
+        profile_interests.update(
+            str(item).strip() for item in analysis.get("interests", [])
+        )
+        return supported_interest_labels(profile_interests)
+
+    @staticmethod
+    def _named_department(program: Mapping[str, Any]) -> str | None:
+        """학과가 운영하는 프로그램이면 학과명을 반환한다.
+
+        센터·처·연구원 프로그램은 전교생 공통 후보로 남기고, 학과가
+        운영하는 프로그램은 소속 학과 학생에게 우선 노출하기 위한
+        판정이다. 운영 부서는 원본 그대로 사용하며 데이터에는 쓰지 않는다.
+        """
+
+        program_name = str(program.get("program_name", "")).strip()
+        bracket_match = re.match(r"^\[([^\]]+)\]", program_name)
+        if bracket_match:
+            return bracket_match.group(1).strip()
+        department = str(program.get("department_in_charge", "")).strip()
+        compact_department = re.sub(r"\s+", "", department)
+        if re.search(r"(?:학과|과)(?:\([^)]*\))?$", compact_department):
+            return department
+        return None
+
+    @staticmethod
+    def _program_interest_evidence(
+        program: Mapping[str, Any], interests: set[str]
+    ) -> dict[str, tuple[str, ...]]:
+        """비교과의 관심 연결은 제목 또는 설명의 복수 근거일 때만 인정한다.
+
+        비교과 설명에는 여러 분야를 열거하는 홍보 문장이 많다. 따라서 설명
+        본문에 관심 키워드가 한 번 등장한 것만으로 직접 연결이라고 보지 않는다.
+        """
+
+        if not interests:
+            return {}
+        title_evidence = infer_interest_evidence(
+            program.get("program_name", ""), interests
+        )
+        full_evidence = infer_interest_evidence(
+            InterventionRecommender._program_text(program), interests
+        )
+        return {
+            label: keywords
+            for label, keywords in full_evidence.items()
+            if label in title_evidence or len(set(keywords)) >= 2
+        }
 
     @staticmethod
     def _format_match_reason(
@@ -130,6 +234,7 @@ class InterventionRecommender:
         semantic_score: float,
         support_needs: Sequence[str],
         support_match: float,
+        matched_interests: set[str],
     ) -> str:
         """세 추천 요소의 실제 일치 정도를 같은 형식으로 설명한다."""
 
@@ -150,11 +255,17 @@ class InterventionRecommender:
             if support_needs
             else "학생이 요청한 지원수요 없음"
         )
+        interest_detail = (
+            "·".join(sorted(matched_interests))
+            if matched_interests
+            else "직접 연결 없음"
+        )
         return " · ".join(
             (
                 f"위험영역 일치: {risk_detail}",
-                f"학생 서술과 프로그램 설명 유사도: {semantic_score:.0%}",
+                f"대화·프로그램 설명 의미 유사도 참고값: {semantic_score:.0%}",
                 f"체크인 지원수요 일치: {support_detail}",
+                f"관심분야 직접 연결: {interest_detail}",
             )
         )
 
@@ -174,6 +285,7 @@ class InterventionRecommender:
         documents = [self._program_text(program) for program in program_records]
         semantic_scores = self.similarity_backend.similarities(query, documents)
         support_needs = [str(item) for item in analysis.get("support_needs", [])]
+        interests = self._profile_interests(profile, analysis)
         reasons: dict[str, str] = {}
         for program, semantic_score, program_text in zip(
             program_records, semantic_scores, documents
@@ -185,12 +297,16 @@ class InterventionRecommender:
             }
             matched_domains = active_domains & targets
             support_match = self._support_need_score(support_needs, program_text)
+            matched_interests = set(
+                self._program_interest_evidence(program, interests)
+            )
             reasons[str(program["program_id"])] = self._format_match_reason(
                 active_domains,
                 matched_domains,
                 float(semantic_score),
                 support_needs,
                 support_match,
+                matched_interests,
             )
         return reasons
 
@@ -231,8 +347,10 @@ class InterventionRecommender:
         documents = [self._program_text(program) for program in program_records]
         semantic_scores = self.similarity_backend.similarities(query, documents)
         support_needs = [str(item) for item in analysis.get("support_needs", [])]
+        interests = self._profile_interests(profile, analysis)
+        home_department = str(profile.get("department", "")).strip()
 
-        ranked: list[tuple[float, str, ProgramRecommendation]] = []
+        ranked: list[tuple[int, float, str, ProgramRecommendation]] = []
         for program, semantic_score, program_text in zip(
             program_records, semantic_scores, documents
         ):
@@ -248,10 +366,19 @@ class InterventionRecommender:
             support_match = self._support_need_score(
                 support_needs, program_text
             )
+            interest_evidence = self._program_interest_evidence(
+                program,
+                interests,
+            )
+            matched_interests = set(interest_evidence)
+            interest_match = (
+                len(matched_interests) / len(interests) if interests else 0.0
+            )
             total_score = 100 * (
                 float(weights["risk_type_match"]) * risk_match
                 + float(weights["semantic_similarity"]) * float(semantic_score)
                 + float(weights["support_need_match"]) * support_match
+                + float(weights.get("interest_match", 0.0)) * interest_match
             )
             recommendation = ProgramRecommendation(
                 program_id=str(program["program_id"]),
@@ -267,18 +394,60 @@ class InterventionRecommender:
                     float(semantic_score),
                     support_needs,
                     support_match,
+                    matched_interests,
                 ),
             )
-            ranked.append((recommendation.score, recommendation.program_id, recommendation))
+            named_department = self._named_department(program)
+            department_mismatch = bool(
+                named_department
+                and home_department
+                and named_department != home_department
+            )
+            has_student_signals = bool(support_needs or interests)
+            purpose_aligned = bool(
+                not has_student_signals
+                or support_match > 0
+                or matched_interests
+                or (
+                    named_department
+                    and home_department
+                    and named_department == home_department
+                )
+            )
+            relevance_tier = (
+                2 if department_mismatch else (0 if purpose_aligned else 1)
+            )
+            ranked.append(
+                (
+                    relevance_tier,
+                    recommendation.score,
+                    recommendation.program_id,
+                    recommendation,
+                )
+            )
 
-        ranked.sort(key=lambda item: (-item[0], item[1]))
+        ranked.sort(key=lambda item: (item[0], -item[1], item[2]))
         backend_name = self.similarity_backend.backend_name
         warning = None
         if isinstance(self.similarity_backend, ResilientSimilarityBackend):
             backend_name = self.similarity_backend.last_backend_name
             warning = self.similarity_backend.last_warning
+        selected: list[ProgramRecommendation] = []
+        selected_names: set[str] = set()
+        for _, _, _, recommendation in ranked:
+            normalized_name = re.sub(
+                r"[^가-힣a-z0-9]+",
+                "",
+                recommendation.program_name.lower(),
+            )
+            if normalized_name in selected_names:
+                continue
+            selected.append(recommendation)
+            selected_names.add(normalized_name)
+            if len(selected) == limit:
+                break
         return RecommendationResult(
-            recommendations=tuple(item[2] for item in ranked[:limit]),
+            recommendations=tuple(selected),
             similarity_backend=backend_name,
             warning=warning,
         )

@@ -11,6 +11,12 @@ from src.alert_validation_service import (
     build_synthetic_reference_labels,
     evaluate_initial_alerts,
 )
+from src.course_recommendation_evaluation_service import (
+    CourseRecommendationEvaluationReport,
+    course_recommendation_evaluation_catalog,
+    evaluate_course_recommendations,
+)
+from src.course_recommender import CourseRecommender
 from src.kare_evaluation_service import (
     KARE_SYNTHETIC_EVALUATION_CASES,
     KareEvaluationReport,
@@ -45,6 +51,20 @@ def load_kare_regression() -> KareEvaluationReport:
     """네트워크 없이 15개 synthetic 대화를 Mock Kare로 회귀 점검한다."""
 
     return evaluate_kare_dialogues(MockAIProvider())
+
+
+@st.cache_resource(show_spinner=False)
+def load_course_recommendation_regression() -> tuple[
+    CourseRecommendationEvaluationReport, str
+]:
+    """현재 Repository 교과 master로 synthetic 추천 관련성을 점검한다."""
+
+    repository = get_default_repository()
+    report = evaluate_course_recommendations(
+        CourseRecommender(),
+        repository.get_courses(),
+    )
+    return report, type(repository).__name__
 
 
 st.set_page_config(page_title="초기경보 모델 검증", page_icon="✅", layout="wide")
@@ -253,5 +273,76 @@ with st.expander("Kare 대화 품질 회귀 검증 · synthetic 15개", expanded
     st.caption(
         "실제 운영 정확도는 별도의 학생 동의·교직원 검토 절차로 만든 참조 데이터가 있어야 평가할 수 있습니다."
     )
+
+with st.expander("교과 추천 내부 관련성 검증 · synthetic 10개", expanded=False):
+    st.caption(
+        "5개 적용 학과의 진로·학습 요구를 두 사례씩 점검합니다. 허용 과목군은 추천 순위에 "
+        "사용하지 않고, 추천 후 과목명·공개 강좌 설명의 관련성만 확인합니다."
+    )
+    evaluation_catalog = course_recommendation_evaluation_catalog().rename(
+        columns={
+            "case_id": "사례",
+            "title": "학습 요구",
+            "department": "학과",
+            "grade": "학년",
+            "interest_fields": "관심 분야",
+            "desired_job": "희망 직무",
+            "acceptable_families": "사후 확인 과목군",
+        }
+    )
+    st.dataframe(evaluation_catalog, width="stretch", hide_index=True)
+
+    if st.button(
+        "현재 교과 master 추천 10건 점검",
+        key="run_course_recommendation_regression",
+        use_container_width=True,
+    ):
+        with st.spinner("교과 추천과 과목군 관련성을 점검하고 있어요..."):
+            st.session_state["course_recommendation_regression"] = (
+                load_course_recommendation_regression()
+            )
+
+    course_evaluation = st.session_state.get("course_recommendation_regression")
+    if course_evaluation is not None:
+        course_report, course_repository_name = course_evaluation
+        course_metrics = st.columns(5)
+        course_metrics[0].metric("평가 사례", f"{course_report.case_count}개")
+        course_metrics[1].metric(
+            "조건 통과",
+            f"{course_report.case_pass_rate:.1f}%",
+        )
+        course_metrics[2].metric(
+            "과목군 포괄",
+            f"{course_report.family_coverage_rate:.1f}%",
+        )
+        course_metrics[3].metric(
+            "관련 과목",
+            f"{course_report.relevant_course_rate:.1f}%",
+        )
+        course_metrics[4].metric(
+            "DB·중복 오류",
+            f"{course_report.unknown_course_count + course_report.duplicate_course_count}건",
+        )
+        course_display = course_report.details.rename(
+            columns={
+                "case_id": "사례",
+                "title": "학습 요구",
+                "department": "학과",
+                "recommended_courses": "추천 교과목",
+                "matched_families": "확인된 과목군",
+                "family_matches": "과목군 포괄",
+                "relevant_courses": "관련 과목",
+                "home_cross_courses": "학과 구성",
+                "backend": "유사도 방식",
+                "passed": "통과",
+                "issues": "검토 사항",
+                "error": "오류",
+            }
+        )
+        st.dataframe(course_display, width="stretch", hide_index=True)
+        st.caption(
+            f"데이터 provider: {course_repository_name}. 이 수치는 synthetic 내부 회귀 "
+            "기준이며 실제 학생 추천 정확도나 교육 효과를 의미하지 않습니다."
+        )
 
 render_footer()

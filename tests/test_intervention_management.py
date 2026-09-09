@@ -128,6 +128,74 @@ def test_existing_database_is_migrated_without_removing_rows(
     )
 
 
+def test_legacy_learning_path_is_migrated_to_versioned_history(
+    tmp_path: Path,
+) -> None:
+    """기존 체크인별 경로를 v1로 보존하고 v2 저장을 허용한다."""
+
+    database_path = tmp_path / "legacy-learning-path.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE learning_paths (
+                path_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                analysis_batch_id TEXT NOT NULL,
+                student_id TEXT NOT NULL,
+                source_checkin_id INTEGER,
+                path_name TEXT NOT NULL,
+                related_job TEXT,
+                competencies TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (analysis_batch_id, student_id)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX idx_learning_paths_checkin "
+            "ON learning_paths(source_checkin_id) "
+            "WHERE source_checkin_id IS NOT NULL"
+        )
+        connection.execute(
+            """
+            INSERT INTO learning_paths (
+                analysis_batch_id, student_id, source_checkin_id,
+                path_name, competencies, reason
+            ) VALUES ('legacy-v1', 'STU001', 7, '기존 경로', '[]', '기존 근거')
+            """
+        )
+        connection.commit()
+
+    initialize_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        legacy = connection.execute(
+            "SELECT generation_version FROM learning_paths WHERE path_id = 1"
+        ).fetchone()
+        index_names = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA index_list(learning_paths)"
+            ).fetchall()
+        }
+        connection.execute(
+            """
+            INSERT INTO learning_paths (
+                analysis_batch_id, student_id, source_checkin_id,
+                generation_version, path_name, competencies, reason
+            ) VALUES ('new-v2', 'STU001', 7, 2, '새 경로', '[]', '새 근거')
+            """
+        )
+        version_count = connection.execute(
+            "SELECT COUNT(*) FROM learning_paths WHERE source_checkin_id = 7"
+        ).fetchone()[0]
+
+    assert legacy == (1,)
+    assert "idx_learning_paths_checkin" not in index_names
+    assert "idx_learning_paths_checkin_version" in index_names
+    assert version_count == 2
+
+
 def test_recommendation_batch_and_review_state_survive_new_service(
     tmp_path: Path,
 ) -> None:
@@ -236,6 +304,134 @@ def test_integrated_review_reports_when_learning_path_is_not_saved(
 
     assert path_updated is False
     assert service.get_intervention(context.intervention_id)["status"] == "추후 관찰"
+
+
+def test_separate_review_keeps_program_and_course_decisions_independent(
+    tmp_path: Path,
+) -> None:
+    """비교과 승인과 교과 조정 및 과목별 판정을 서로 덮어쓰지 않는다."""
+
+    database_path = tmp_path / "separate-review.db"
+    checkin_id = StudentCheckinDataStore(database_path).save_checkin(
+        "STU001", _checkin_values()
+    )
+    service = InterventionManagementService(database_path=database_path)
+    context = service.record_recommendation_batch(
+        "STU001",
+        _recommendations(),
+        source_checkin_id=checkin_id,
+        initial_status="교직원 검토 대기",
+    )
+    LearningPathDataStore(database_path).save_analysis(
+        paths=[
+            {
+                "student_id": "STU001",
+                "path_name": "독립 검토 경로",
+                "related_job": "데이터 분석",
+                "competencies": ["기초분석"],
+                "reason": "독립 상태 저장 테스트",
+                "courses": [
+                    {
+                        "course_id": f"C{index:03d}",
+                        "sequence": index,
+                        "score": 90.0 - index,
+                        "reason": f"{index}단계 과목",
+                    }
+                    for index in range(1, 4)
+                ],
+            }
+        ],
+        candidates=[],
+        source_checkin_id=checkin_id,
+    )
+
+    path_updated = service.apply_separate_review_actions(
+        intervention_id=context.intervention_id,
+        program_decision="승인",
+        program_note="비교과 연결 조건 확인",
+        course_decision="조정 필요",
+        course_note="C003을 다른 과목으로 교체 필요",
+        course_judgments={
+            "C001": "적절",
+            "C002": "보조적으로 적절",
+            "C003": "부적절",
+        },
+    )
+
+    intervention = service.get_intervention(context.intervention_id)
+    path = LearningPathDataStore(database_path).get_learning_path_by_checkin(
+        checkin_id
+    )
+    assert path_updated is True
+    assert intervention is not None
+    assert intervention["staff_action"] == "추천 검토 승인"
+    assert intervention["staff_note"] == "비교과 연결 조건 확인"
+    assert path["review_status"].unique().tolist() == ["조정 필요"]
+    assert path["review_note"].unique().tolist() == [
+        "C003을 다른 과목으로 교체 필요"
+    ]
+    assert dict(zip(path["course_id"], path["review_judgment"])) == {
+        "C001": "적절",
+        "C002": "보조적으로 적절",
+        "C003": "부적절",
+    }
+
+
+def test_separate_course_approval_requires_every_course_judgment(
+    tmp_path: Path,
+) -> None:
+    """경로 승인은 모든 과목을 명시적으로 확인한 뒤에만 허용한다."""
+
+    database_path = tmp_path / "course-review-guard.db"
+    checkin_id = StudentCheckinDataStore(database_path).save_checkin(
+        "STU001", _checkin_values()
+    )
+    service = InterventionManagementService(database_path=database_path)
+    context = service.record_recommendation_batch(
+        "STU001", _recommendations(), source_checkin_id=checkin_id
+    )
+    LearningPathDataStore(database_path).save_analysis(
+        paths=[
+            {
+                "student_id": "STU001",
+                "path_name": "승인 확인 경로",
+                "related_job": "데이터 분석",
+                "competencies": ["기초분석"],
+                "reason": "과목별 확인 테스트",
+                "courses": [
+                    {
+                        "course_id": f"C{index:03d}",
+                        "sequence": index,
+                        "score": 90.0 - index,
+                        "reason": f"{index}단계 과목",
+                    }
+                    for index in range(1, 4)
+                ],
+            }
+        ],
+        candidates=[],
+        source_checkin_id=checkin_id,
+    )
+
+    with pytest.raises(ValueError, match="모든 추천 교과목"):
+        service.apply_separate_review_actions(
+            intervention_id=context.intervention_id,
+            program_decision="승인",
+            course_decision="승인",
+            course_judgments={"C001": "적절"},
+        )
+
+    with pytest.raises(ValueError, match="교과 승인 전"):
+        service.apply_separate_review_actions(
+            intervention_id=context.intervention_id,
+            program_decision="승인",
+            course_decision="승인",
+            course_judgments={
+                "C001": "적절",
+                "C002": "보조적으로 적절",
+                "C003": "부적절",
+            },
+        )
 
 
 def test_integrated_adjustment_records_note_without_regenerating_recommendations(

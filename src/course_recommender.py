@@ -8,6 +8,10 @@ from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
+from src.recommendation_interest import (
+    infer_interest_evidence,
+    supported_interest_labels,
+)
 from src.similarity import ResilientSimilarityBackend, SimilarityBackend, create_similarity_backend
 from src.utils import load_app_config
 
@@ -70,6 +74,7 @@ class _CourseCandidate:
     coverage_terms: frozenset[str]
     reason: str
     is_home_department: bool
+    matched_interests: frozenset[str]
 
 
 def _split_values(value: Any) -> set[str]:
@@ -121,7 +126,7 @@ class CourseRecommender:
     def _profile_interests(profile: Mapping[str, Any], analysis: Mapping[str, Any]) -> set[str]:
         interests = _split_values(profile.get("interest_fields", ""))
         interests.update(str(item) for item in analysis.get("interests", []))
-        return interests
+        return supported_interest_labels(interests)
 
     @staticmethod
     def _profile_text(profile: Mapping[str, Any], analysis: Mapping[str, Any]) -> str:
@@ -202,6 +207,9 @@ class CourseRecommender:
         max_same_name_family = int(
             source_policy.get("max_same_name_family", 1)
         )
+        minimum_interest_courses = int(
+            config.get("minimum_interest_aligned_courses", 0)
+        )
         if not 0.0 <= home_department_bonus <= 1.0:
             raise ValueError("소속 학과 추천 가점은 0과 1 사이여야 합니다.")
         if not 0.0 <= source_home_department_bonus <= 1.0:
@@ -214,6 +222,8 @@ class CourseRecommender:
             raise ValueError("실제 개설강좌 후보군은 추천 개수 이상이어야 합니다.")
         if max_general_education_courses < 0 or max_same_name_family < 1:
             raise ValueError("실제 개설강좌 다양성 설정을 확인해 주세요.")
+        if not 0 <= minimum_interest_courses <= limit:
+            raise ValueError("관심 분야 우선 과목 수가 추천 개수를 벗어났습니다.")
         grade = int(profile.get("grade", 1))
         home_department = str(profile.get("department", "")).strip()
         completed = {str(course_id) for course_id in completed_course_ids}
@@ -264,7 +274,17 @@ class CourseRecommender:
 
         candidates: list[_CourseCandidate] = []
         for course, semantic_score in zip(eligible_records, semantic_scores):
-            course_interests = _split_values(course["related_interests"])
+            explicit_course_interests = _split_values(
+                course["related_interests"]
+            )
+            inferred_interest_evidence = infer_interest_evidence(
+                self._course_text(course),
+                interests,
+            )
+            course_interests = explicit_course_interests | set(
+                inferred_interest_evidence
+            )
+            matched_interests = interests & course_interests
             course_jobs = _split_values(course["related_jobs"])
             competencies = _split_values(course["competencies"])
             source_attributes = _source_attributes(course)
@@ -314,8 +334,30 @@ class CourseRecommender:
                 reasons.append("소속 학과 우선")
             elif home_department:
                 reasons.append("타과 과목으로 역량 범위 확장")
-            if interests & course_interests:
-                reasons.append("관심분야와 연결")
+            if matched_interests:
+                inferred_matches = sorted(
+                    matched_interests & set(inferred_interest_evidence)
+                )
+                if inferred_matches:
+                    matched_keywords = sorted(
+                        {
+                            keyword
+                            for label in inferred_matches
+                            for keyword in inferred_interest_evidence[label]
+                        }
+                    )
+                    reasons.append(
+                        "관심분야 직접 연결: "
+                        + "·".join(sorted(matched_interests))
+                        + " (과목명·설명 근거: "
+                        + "·".join(matched_keywords[:4])
+                        + ")"
+                    )
+                else:
+                    reasons.append(
+                        "관심분야 직접 연결: "
+                        + "·".join(sorted(matched_interests))
+                    )
             if job_match:
                 reasons.append("희망직무와 연결")
             if needed_competencies & competencies:
@@ -329,9 +371,13 @@ class CourseRecommender:
                 ):
                     reasons.append("타과 수강 가능 여부 확인 필요")
             reasons.append(
-                f"학생 서술과 과목 정보 유사도 {float(semantic_score):.0%}"
+                "대화·과목 정보 의미 유사도 참고값 "
+                f"{float(semantic_score):.0%}"
             )
-            coverage_terms = competencies or source_attributes
+            coverage_terms = set(competencies or source_attributes)
+            coverage_terms.update(
+                f"관심:{label}" for label in matched_interests
+            )
             candidates.append(
                 _CourseCandidate(
                     course=course,
@@ -341,8 +387,23 @@ class CourseRecommender:
                     coverage_terms=frozenset(coverage_terms),
                     reason=" · ".join(reasons) or "체크인 내용과 연관",
                     is_home_department=is_home_department,
+                    matched_interests=frozenset(matched_interests),
                 )
             )
+
+        interest_gate_fallback = False
+        if interests:
+            interest_relevant_candidates = [
+                item
+                for item in candidates
+                if item.is_home_department or item.matched_interests
+            ]
+            if len(interest_relevant_candidates) >= int(
+                config["minimum_courses"]
+            ):
+                candidates = interest_relevant_candidates
+            else:
+                interest_gate_fallback = True
 
         ranked_candidates = sorted(
             candidates,
@@ -362,13 +423,31 @@ class CourseRecommender:
             else int(config["candidate_pool_size"])
         )
         candidate_pool = ranked_candidates[:pool_size]
-        available_home_courses = sum(
-            item.is_home_department for item in candidate_pool
-        )
-        effective_source_cross_limit = max(
-            source_maximum_cross_courses,
-            limit - min(available_home_courses, limit),
-        )
+        pool_course_ids = {
+            str(item.course["course_id"]) for item in candidate_pool
+        }
+        for item in ranked_candidates:
+            course_id = str(item.course["course_id"])
+            if item.matched_interests and course_id not in pool_course_ids:
+                candidate_pool.append(item)
+                pool_course_ids.add(course_id)
+        source_home_candidates = [
+            item for item in ranked_candidates if item.is_home_department
+        ]
+        if has_source_backed_candidates and source_home_candidates:
+            required_source_home_courses = max(
+                minimum_home_courses,
+                limit - source_maximum_cross_courses,
+            )
+            for item in source_home_candidates[:required_source_home_courses]:
+                course_id = str(item.course["course_id"])
+                if course_id not in pool_course_ids:
+                    candidate_pool.append(item)
+                    pool_course_ids.add(course_id)
+            effective_source_cross_limit = source_maximum_cross_courses
+        else:
+            # 소속 학과 개설강좌 자체가 없을 때만 타과 경로 fallback을 허용한다.
+            effective_source_cross_limit = limit
 
         selected: list[_CourseCandidate] = []
         covered: set[str] = set()
@@ -422,9 +501,15 @@ class CourseRecommender:
                 -numeric_id,
             )
 
-        home_candidates = [
-            item for item in ranked_candidates if item.is_home_department
-        ]
+        def select(item: _CourseCandidate) -> None:
+            """선정 항목과 이후 다양성 계산용 누적 근거를 함께 갱신한다."""
+
+            selected.append(item)
+            covered.update(item.competencies)
+            covered_source_attributes.update(item.source_attributes)
+            covered_terms.update(item.coverage_terms)
+
+        home_candidates = source_home_candidates
         required_home_courses = min(
             minimum_home_courses,
             len(home_candidates),
@@ -435,22 +520,41 @@ class CourseRecommender:
             if not selectable_home:
                 break
             best_home = max(selectable_home, key=selection_value)
-            selected.append(best_home)
-            covered.update(best_home.competencies)
-            covered_source_attributes.update(best_home.source_attributes)
-            covered_terms.update(best_home.coverage_terms)
+            select(best_home)
             home_candidates.remove(best_home)
 
         remaining = [item for item in candidate_pool if item not in selected]
+        available_interest_candidates = [
+            item for item in candidate_pool if item.matched_interests
+        ]
+        required_interest_courses = min(
+            minimum_interest_courses,
+            len(available_interest_candidates),
+            limit,
+        )
+        while (
+            remaining
+            and len(selected) < limit
+            and sum(bool(item.matched_interests) for item in selected)
+            < required_interest_courses
+        ):
+            selectable_interest = [
+                item
+                for item in remaining
+                if item.matched_interests and can_select(item)
+            ]
+            if not selectable_interest:
+                break
+            best_interest = max(selectable_interest, key=selection_value)
+            select(best_interest)
+            remaining.remove(best_interest)
+
         while remaining and len(selected) < limit:
             selectable = [item for item in remaining if can_select(item)]
             if not selectable:
                 break
             best = max(selectable, key=selection_value)
-            selected.append(best)
-            covered.update(best.competencies)
-            covered_source_attributes.update(best.source_attributes)
-            covered_terms.update(best.coverage_terms)
+            select(best)
             remaining.remove(best)
         if len(selected) < int(config["minimum_courses"]):
             raise ValueError("학습경로를 구성할 교과목이 부족합니다.")
@@ -537,6 +641,19 @@ class CourseRecommender:
             warnings.append(
                 "수강 조건을 충족하는 소속 학과 과목이 없어 "
                 "관심분야·희망직무와 연결된 타과 과목으로 구성했습니다."
+            )
+        if interest_gate_fallback:
+            warnings.append(
+                "명시한 관심 분야와 직접 연결되는 수강 가능 과목이 부족해 "
+                "일부 과목은 학과·학년·대화 맥락을 기준으로 보완했습니다."
+            )
+        selected_interest_count = sum(
+            bool(item.matched_interests) for item in selected
+        )
+        if interests and selected_interest_count < required_interest_courses:
+            warnings.append(
+                "과목 영역·타과 수강 제한으로 관심 분야 우선 과목 수를 모두 "
+                "확보하지 못했습니다."
             )
         if isinstance(self.similarity_backend, ResilientSimilarityBackend):
             backend_name = self.similarity_backend.last_backend_name

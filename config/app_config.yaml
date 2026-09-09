@@ -32,17 +32,19 @@ data:
 recommendation:
   top_k: 3
   weights:
-    risk_type_match: 0.55
-    semantic_similarity: 0.30
-    support_need_match: 0.15
+    risk_type_match: 0.30
+    semantic_similarity: 0.20
+    support_need_match: 0.30
+    interest_match: 0.20
   similarity:
     prefer_sentence_transformers: true
     sentence_transformer_model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-    local_files_only: true
+    local_files_only: false
 
 course_recommendation:
   top_k: 4
   minimum_courses: 3
+  minimum_interest_aligned_courses: 2
   candidate_pool_size: 20
   diversity_bonus: 0.08
   department_policy:

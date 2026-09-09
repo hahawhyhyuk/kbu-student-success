@@ -37,7 +37,7 @@ STAFF_SUBMENUS = (
     ),
     (
         "03_ai_intervention.py",
-        ["학생 · AI 이해", "비교과 추천", "교과 학습경로", "통합 승인", "학생 피드백"],
+        ["학생 · AI 이해", "비교과 추천", "교과 학습경로", "최종 검토", "학생 피드백"],
     ),
     (
         "05_intervention_management.py",

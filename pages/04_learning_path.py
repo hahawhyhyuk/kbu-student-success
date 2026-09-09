@@ -11,7 +11,11 @@ from src.ai import create_ai_provider
 from src.checkin_service import CheckinAnalysisService
 from src.course_catalog_presenter import format_course_caption
 from src.course_recommender import CourseRecommender
-from src.learning_path_builder import LearningPathBuilder, LearningPathResult
+from src.learning_path_builder import (
+    LearningPathBuilder,
+    LearningPathResult,
+    ordered_courses_by_sequence,
+)
 from src.repositories import get_default_repository
 from src.risk_service import (
     create_integrated_risk_service,
@@ -183,11 +187,18 @@ if stored_path.empty and generate_clicked:
                 latest_profile["natural_language_concern"] = str(
                     submitted_checkin.get("natural_language_concern", "")
                 )
+                path_generation_version = int(
+                    (staff_context.intervention or {}).get(
+                        "generation_version", 1
+                    )
+                )
                 result, _ = path_service.build_and_store_learning_path(
                     selected_student_id,
                     latest_profile,
                     analysis,
                     source,
+                    generation_version=path_generation_version,
+                    create_new_version=path_generation_version > 1,
                 )
                 st.session_state[result_key] = result
                 queue_ai_reveal(
@@ -310,7 +321,7 @@ elif stored_result:
         }
         st.subheader("권장 학습 순서")
         master_ids = set(courses["course_id"].astype(str))
-        for course in selection.courses:
+        for course in ordered_courses_by_sequence(selection, explanation):
             if (
                 course.course_id not in master_ids
                 or course.course_id in completed_ids

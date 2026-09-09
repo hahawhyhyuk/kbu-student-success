@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from src.ai import AIProvider, ResilientAIProvider, validate_learning_path_explanation
-from src.course_recommender import CoursePathSelection
+from src.course_recommender import CoursePathSelection, CourseRecommendation
 
 
 @dataclass(frozen=True)
@@ -16,6 +16,38 @@ class LearningPathResult:
     provider_name: str
     fallback_used: bool
     warning: str | None = None
+
+
+def ordered_courses_by_sequence(
+    selection: CoursePathSelection,
+    explanation: Mapping[str, Any],
+) -> tuple[CourseRecommendation, ...]:
+    """AI 설명의 검증된 sequence 순서로 선정 교과목을 반환한다.
+
+    Parameters:
+        selection: deterministic 추천기가 선정한 DB 교과목.
+        explanation: schema 검증을 통과한 학습경로 설명.
+
+    Returns:
+        sequence가 1부터 증가하도록 정렬한 같은 교과목 튜플.
+
+    Assumptions:
+        explanation은 ``validate_learning_path_explanation``을 통과해 모든
+        선정 교과목 ID와 중복 없는 연속 sequence를 포함한다.
+    """
+
+    roles_by_id = {
+        str(item["course_id"]): item
+        for item in explanation["course_roles"]
+    }
+    return tuple(
+        sorted(
+            selection.courses,
+            key=lambda course: int(
+                roles_by_id[course.course_id]["sequence"]
+            ),
+        )
+    )
 
 
 class LearningPathBuilder:

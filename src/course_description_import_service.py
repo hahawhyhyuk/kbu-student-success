@@ -18,6 +18,7 @@ from src.support_program_importer import EMAIL_PATTERN, PHONE_PATTERN
 
 
 DESCRIPTION_SOURCE = "course_lecture_basic_information"
+DEFAULT_COURSE_DESCRIPTION_FILE = "강좌기본정보2026-2025.xlsx"
 MIN_DESCRIPTION_LENGTH = 20
 DESCRIPTION_PROVENANCE_COLUMNS: tuple[str, ...] = (
     "description_source",
@@ -613,7 +614,18 @@ def run_course_description_enrichment_dry_run(
 
 
 def find_default_course_description_file(root: Path) -> Path:
-    """프로젝트 상위 폴더의 강좌기본정보 Excel 하나를 찾는다."""
+    """프로젝트 상위 폴더에서 최신 기본 강좌설명 Excel을 찾는다.
+
+    Parameters:
+        root: 강좌기본정보 Excel을 찾을 폴더.
+
+    Returns:
+        ``강좌기본정보2026-2025.xlsx``가 있으면 해당 파일을 우선하고,
+        그렇지 않으면 유일한 강좌기본정보 Excel을 반환한다.
+
+    Assumptions:
+        Excel 잠금 파일은 제외하며 파일명 비교는 유니코드 정규화 후 수행한다.
+    """
 
     matches = [
         path
@@ -621,9 +633,21 @@ def find_default_course_description_file(root: Path) -> Path:
         if not path.name.startswith("~$")
         and "강좌기본정보" in _normalize_header(path.name)
     ]
+    preferred_key = _normalize_header(DEFAULT_COURSE_DESCRIPTION_FILE)
+    preferred_matches = [
+        path for path in matches if _normalize_header(path.name) == preferred_key
+    ]
+    if len(preferred_matches) == 1:
+        return preferred_matches[0]
+    if len(preferred_matches) > 1:
+        raise FileNotFoundError(
+            f"기본 강좌설명 Excel `{DEFAULT_COURSE_DESCRIPTION_FILE}`이 "
+            f"중복되어 있습니다. 현재 {len(preferred_matches)}개입니다."
+        )
     if len(matches) != 1:
         raise FileNotFoundError(
-            "강좌기본정보 Excel은 정확히 1개 필요합니다. "
+            f"기본 파일 `{DEFAULT_COURSE_DESCRIPTION_FILE}`이 없을 때는 "
+            "강좌기본정보 Excel이 정확히 1개 필요합니다. "
             f"현재 {len(matches)}개입니다."
         )
     return matches[0]

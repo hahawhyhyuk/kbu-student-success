@@ -6,9 +6,10 @@ import json
 import math
 import sqlite3
 import uuid
+from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import pandas as pd
 
@@ -43,6 +44,33 @@ def _connect(database_path: Path) -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
+
+
+@contextmanager
+def database_transaction(
+    database_path: str | Path,
+    connection: sqlite3.Connection | None = None,
+) -> Iterator[sqlite3.Connection]:
+    """관련 저장을 함께 확정하거나 실패 시 모두 되돌린다.
+
+    Parameters:
+        database_path: 스키마 초기화를 마친 SQLite 파일.
+        connection: 같은 DB의 외부 트랜잭션에 참여할 때 전달하는 연결.
+
+    Returns:
+        저장소 메서드에 전달할 SQLite 연결을 yield한다.
+
+    Assumptions:
+        전달된 연결은 여기서 commit하거나 닫지 않는다. 가장 바깥 호출이
+        성공 시 commit, 예외 시 rollback과 close를 책임지며 AI 호출은 그 전에 한다.
+    """
+
+    if connection is not None:
+        yield connection
+        return
+    with closing(_connect(Path(database_path))) as active_connection:
+        with active_connection:
+            yield active_connection
 
 
 def _migrate_student_checkins_for_narrative(
@@ -416,6 +444,7 @@ def initialize_database(database_path: str | Path | None = None) -> Path:
                 analysis_batch_id TEXT NOT NULL,
                 student_id TEXT NOT NULL,
                 source_checkin_id INTEGER,
+                generation_version INTEGER NOT NULL DEFAULT 1,
                 path_name TEXT NOT NULL,
                 related_job TEXT,
                 competencies TEXT NOT NULL,
@@ -442,6 +471,7 @@ def initialize_database(database_path: str | Path | None = None) -> Path:
                 "ALTER TABLE learning_paths ADD COLUMN source_checkin_id INTEGER"
             )
         learning_path_migration_columns = {
+            "generation_version": "INTEGER NOT NULL DEFAULT 1",
             "career_connection": "TEXT DEFAULT ''",
             "provider_name": "TEXT DEFAULT ''",
             "fallback_used": "INTEGER DEFAULT 0",
@@ -464,6 +494,7 @@ def initialize_database(database_path: str | Path | None = None) -> Path:
                 score REAL NOT NULL,
                 reason TEXT NOT NULL,
                 selection_reason TEXT NOT NULL DEFAULT '',
+                review_judgment TEXT NOT NULL DEFAULT '판단 전',
                 PRIMARY KEY (path_id, course_id),
                 FOREIGN KEY (path_id) REFERENCES learning_paths(path_id)
                     ON DELETE CASCADE
@@ -476,11 +507,18 @@ def initialize_database(database_path: str | Path | None = None) -> Path:
                 "PRAGMA table_info(learning_path_courses)"
             ).fetchall()
         }
-        if "selection_reason" not in learning_path_course_columns:
-            connection.execute(
-                "ALTER TABLE learning_path_courses ADD COLUMN "
-                "selection_reason TEXT DEFAULT ''"
-            )
+        learning_path_course_migration_columns = {
+            "selection_reason": "TEXT DEFAULT ''",
+            "review_judgment": "TEXT NOT NULL DEFAULT '판단 전'",
+        }
+        for column_name, column_type in (
+            learning_path_course_migration_columns.items()
+        ):
+            if column_name not in learning_path_course_columns:
+                connection.execute(
+                    "ALTER TABLE learning_path_courses ADD COLUMN "
+                    f"{column_name} {column_type}"
+                )
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS microdegree_candidates (
@@ -581,9 +619,11 @@ def initialize_database(database_path: str | Path | None = None) -> Path:
             "ON interventions(source_checkin_id, generation_version) "
             "WHERE source_checkin_id IS NOT NULL"
         )
+        connection.execute("DROP INDEX IF EXISTS idx_learning_paths_checkin")
         connection.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_learning_paths_checkin "
-            "ON learning_paths(source_checkin_id) "
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_learning_paths_checkin_version "
+            "ON learning_paths(source_checkin_id, generation_version) "
             "WHERE source_checkin_id IS NOT NULL"
         )
         connection.execute(
@@ -733,6 +773,7 @@ class DemoAlertNotificationDataStore:
         target_status: str,
         *,
         checkin_id: int | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> dict[str, Any] | None:
         """최근 안내 상태를 뒤로 되돌리지 않고 다음 단계로 진행한다.
 
@@ -742,7 +783,7 @@ class DemoAlertNotificationDataStore:
 
         if target_status not in self.STATUSES:
             raise ValueError(f"지원하지 않는 안내 상태입니다: {target_status}")
-        with _connect(self.database_path) as connection:
+        with database_transaction(self.database_path, connection) as connection:
             row = connection.execute(
                 """
                 SELECT *
@@ -786,7 +827,6 @@ class DemoAlertNotificationDataStore:
                 "SELECT * FROM demo_alert_notifications WHERE notification_id = ?",
                 (int(row["notification_id"]),),
             ).fetchone()
-            connection.commit()
         return self._normalize_row(updated)
 
 
@@ -882,6 +922,8 @@ class InterventionDataStore:
         student_id: str,
         recommendations: Sequence[Mapping[str, Any]],
         batch_id: str | None = None,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> tuple[str, dict[str, int]]:
         """한 번에 생성된 추천 후보를 저장하고 target별 DB ID를 반환한다.
 
@@ -889,6 +931,7 @@ class InterventionDataStore:
             student_id: synthetic 학생 식별자.
             recommendations: target_id, score, rank, reason을 가진 추천 목록.
             batch_id: 재현 테스트 등에 사용할 선택적 배치 ID.
+            connection: 외부 저장 트랜잭션에 참여할 선택적 연결.
 
         Returns:
             생성된 배치 ID와 target_id별 recommendation_id mapping.
@@ -910,7 +953,7 @@ class InterventionDataStore:
             raise ValueError("한 추천 배치에 중복 target_id를 저장할 수 없습니다.")
 
         recommendation_ids: dict[str, int] = {}
-        with _connect(self.database_path) as connection:
+        with database_transaction(self.database_path, connection) as connection:
             for item, target_id in zip(recommendations, target_ids):
                 cursor = connection.execute(
                     """
@@ -930,19 +973,21 @@ class InterventionDataStore:
                     ),
                 )
                 recommendation_ids[target_id] = int(cursor.lastrowid)
-            connection.commit()
         return active_batch_id, recommendation_ids
 
     def save_risk_snapshot(
         self,
         student_id: str,
         snapshot: Mapping[str, Any],
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> int:
         """개입 생성 시점의 위험 결과를 변경 불가 스냅샷으로 저장한다.
 
         Parameters:
             student_id: 개입 대상 학생 ID.
             snapshot: 위험엔진이 산출한 주차·5개 영역·종합 점수와 분류.
+            connection: 외부 저장 트랜잭션에 참여할 선택적 연결.
 
         Returns:
             새로 생성된 snapshot_id.
@@ -1022,7 +1067,7 @@ class InterventionDataStore:
             else int(raw_checkin_id)
         )
 
-        with _connect(self.database_path) as connection:
+        with database_transaction(self.database_path, connection) as connection:
             if student_checkin_id is not None:
                 checkin = connection.execute(
                     "SELECT student_id FROM student_checkins WHERE checkin_id = ?",
@@ -1059,7 +1104,6 @@ class InterventionDataStore:
                     student_checkin_id,
                 ),
             )
-            connection.commit()
             return int(cursor.lastrowid)
 
     def get_risk_snapshot(self, snapshot_id: int) -> dict[str, Any] | None:
@@ -1094,13 +1138,15 @@ class InterventionDataStore:
         source_checkin_id: int | None = None,
         generation_version: int = 1,
         initial_status: str = "추천 생성",
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> int:
         """추천 배치에 대응하는 교직원 개입 기록을 생성한다."""
 
         normalized_student_id = str(student_id).strip()
         if int(generation_version) < 1:
             raise ValueError("추천 생성 버전은 1 이상이어야 합니다.")
-        with _connect(self.database_path) as connection:
+        with database_transaction(self.database_path, connection) as connection:
             if risk_snapshot_id is not None:
                 snapshot = connection.execute(
                     "SELECT student_id FROM risk_snapshots WHERE snapshot_id = ?",
@@ -1141,7 +1187,6 @@ class InterventionDataStore:
                     str(initial_status),
                 ),
             )
-            connection.commit()
             return int(cursor.lastrowid)
 
     def update_intervention(
@@ -1192,10 +1237,51 @@ class InterventionDataStore:
             연결되어 있을 때만 통합 검토 대상이다.
         """
 
+        return self.update_separate_recommendation_review(
+            intervention_id=intervention_id,
+            intervention_status=intervention_status,
+            program_staff_action=staff_action,
+            program_note=staff_note,
+            learning_path_status=learning_path_status,
+            learning_path_note=staff_note,
+        )
+
+    def update_separate_recommendation_review(
+        self,
+        intervention_id: int,
+        intervention_status: str,
+        program_staff_action: str,
+        program_note: str,
+        learning_path_status: str | None,
+        learning_path_note: str = "",
+        course_judgments: Mapping[str, str] | None = None,
+    ) -> bool:
+        """비교과와 교과의 독립 검토 결과를 한 트랜잭션으로 저장한다.
+
+        Parameters:
+            intervention_id: 검토할 추천 버전의 지원 ID.
+            intervention_status: 비교과 판단에 따른 지원 진행 상태.
+            program_staff_action: 비교과 추천의 교직원 판단.
+            program_note: 비교과 추천 검토 메모.
+            learning_path_status: 교과 학습경로 판단. 경로가 없으면 ``None``.
+            learning_path_note: 교과 학습경로 검토 메모.
+            course_judgments: 현재 경로 과목 ID별 적절성 판정.
+
+        Returns:
+            같은 체크인·버전의 학습경로를 갱신했는지 여부.
+
+        Assumptions:
+            추천 항목을 다시 생성하지 않고 현재 버전의 검토 이력만 변경한다.
+        """
+
+        normalized_judgments = {
+            str(course_id): str(judgment)
+            for course_id, judgment in (course_judgments or {}).items()
+        }
         with _connect(self.database_path) as connection:
             intervention = connection.execute(
                 """
-                SELECT source_checkin_id
+                SELECT source_checkin_id, generation_version
                 FROM interventions
                 WHERE intervention_id = ?
                 """,
@@ -1214,28 +1300,74 @@ class InterventionDataStore:
                 """,
                 (
                     str(intervention_status),
-                    str(staff_action),
-                    str(staff_note),
+                    str(program_staff_action),
+                    str(program_note),
                     int(intervention_id),
                 ),
             )
             source_checkin_id = intervention["source_checkin_id"]
+            generation_version = int(intervention["generation_version"] or 1)
             learning_path_updated = False
-            if source_checkin_id is not None:
+            if source_checkin_id is not None and learning_path_status is not None:
                 cursor = connection.execute(
                     """
                     UPDATE learning_paths
                     SET review_status = ?, review_note = ?,
                         reviewed_at = CURRENT_TIMESTAMP
                     WHERE source_checkin_id = ?
+                      AND generation_version = ?
                     """,
                     (
                         str(learning_path_status),
-                        str(staff_note),
+                        str(learning_path_note),
                         int(source_checkin_id),
+                        generation_version,
                     ),
                 )
                 learning_path_updated = cursor.rowcount > 0
+                if normalized_judgments:
+                    path = connection.execute(
+                        """
+                        SELECT path_id
+                        FROM learning_paths
+                        WHERE source_checkin_id = ? AND generation_version = ?
+                        ORDER BY path_id DESC
+                        LIMIT 1
+                        """,
+                        (int(source_checkin_id), generation_version),
+                    ).fetchone()
+                    if path is None:
+                        raise ValueError(
+                            "과목별 판정을 저장할 학습경로가 없습니다."
+                        )
+                    path_id = int(path["path_id"])
+                    existing_course_ids = {
+                        str(row["course_id"])
+                        for row in connection.execute(
+                            """
+                            SELECT course_id
+                            FROM learning_path_courses
+                            WHERE path_id = ?
+                            """,
+                            (path_id,),
+                        ).fetchall()
+                    }
+                    unknown_course_ids = (
+                        set(normalized_judgments) - existing_course_ids
+                    )
+                    if unknown_course_ids:
+                        raise ValueError(
+                            "현재 학습경로에 없는 교과목 판정은 저장할 수 없습니다."
+                        )
+                    for course_id, judgment in normalized_judgments.items():
+                        connection.execute(
+                            """
+                            UPDATE learning_path_courses
+                            SET review_judgment = ?
+                            WHERE path_id = ? AND course_id = ?
+                            """,
+                            (judgment, path_id, course_id),
+                        )
             connection.commit()
         return learning_path_updated
 
@@ -1265,11 +1397,14 @@ class InterventionDataStore:
         return dict(row) if row else None
 
     def get_intervention_by_checkin(
-        self, checkin_id: int
+        self,
+        checkin_id: int,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> dict[str, Any] | None:
         """학생 체크인에 연결된 최신 추천·개입 버전을 반환한다."""
 
-        with _connect(self.database_path) as connection:
+        with database_transaction(self.database_path, connection) as connection:
             row = connection.execute(
                 """
                 SELECT * FROM interventions
@@ -1320,10 +1455,15 @@ class InterventionDataStore:
             records.append(record)
         return pd.DataFrame(records)
 
-    def list_recommendations(self, batch_id: str) -> pd.DataFrame:
+    def list_recommendations(
+        self,
+        batch_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> pd.DataFrame:
         """한 배치의 추천 후보를 순위 순서로 반환한다."""
 
-        with _connect(self.database_path) as connection:
+        with database_transaction(self.database_path, connection) as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM recommendations
@@ -1588,12 +1728,15 @@ class StudentCheckinDataStore:
         self,
         student_id: str,
         values: Mapping[str, Any],
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> int:
         """검증한 학생 자기보고 체크인을 저장하고 ID를 반환한다.
 
         Parameters:
             student_id: 포털 로그인으로 대체 가능한 학생 식별자.
             values: 여섯 Likert 응답과 관심분야·진로·자유서술 값.
+            connection: 외부 저장 트랜잭션에 참여할 선택적 연결.
 
         Returns:
             생성된 checkin_id.
@@ -1639,7 +1782,7 @@ class StudentCheckinDataStore:
                 str(item).strip() for item in interest_fields if str(item).strip()
             ]
         semantic_states = validate_semantic_state(values.get("semantic_states"))
-        with _connect(self.database_path) as connection:
+        with database_transaction(self.database_path, connection) as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO student_checkins (
@@ -1668,7 +1811,6 @@ class StudentCheckinDataStore:
                     json.dumps(semantic_states, ensure_ascii=False),
                 ),
             )
-            connection.commit()
             return int(cursor.lastrowid)
 
     def save_analysis(
@@ -1677,6 +1819,8 @@ class StudentCheckinDataStore:
         analysis: Mapping[str, Any],
         provider_name: str,
         fallback_used: bool,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> int:
         """JSON Schema 검증을 마친 체크인 분석을 원문 응답 없이 저장한다."""
 
@@ -1692,7 +1836,7 @@ class StudentCheckinDataStore:
         missing = required.difference(analysis)
         if missing:
             raise ValueError(f"체크인 분석 필드가 누락되었습니다: {sorted(missing)}")
-        with _connect(self.database_path) as connection:
+        with database_transaction(self.database_path, connection) as connection:
             if connection.execute(
                 "SELECT 1 FROM student_checkins WHERE checkin_id = ?",
                 (int(checkin_id),),
@@ -1719,7 +1863,6 @@ class StudentCheckinDataStore:
                     str(analysis["summary"]),
                 ),
             )
-            connection.commit()
             return int(cursor.lastrowid)
 
     @staticmethod
@@ -1946,6 +2089,10 @@ class LearningPathDataStore:
         candidates: Sequence[Mapping[str, Any]],
         analysis_batch_id: str | None = None,
         source_checkin_id: int | None = None,
+        generation_version: int = 1,
+        create_new_version: bool = False,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> str:
         """한 번의 전체 경로·후보 분석 결과를 원자적으로 저장한다.
 
@@ -1953,6 +2100,11 @@ class LearningPathDataStore:
             paths: 학생별 경로와 DB 교과목 순서를 담은 mapping 목록.
             candidates: 코드가 조건을 검증한 교육과정 후보 목록.
             analysis_batch_id: 재현 테스트용 선택적 배치 ID.
+            source_checkin_id: 개인 경로와 연결할 학생 체크인 ID.
+            generation_version: 같은 체크인 안에서의 추천 버전.
+            create_new_version: 기존 최신 경로를 재사용하지 않고 지정 버전을
+                새로 저장할지 여부.
+            connection: 외부 저장 트랜잭션에 참여할 선택적 연결.
 
         Returns:
             저장된 분석 배치 ID.
@@ -1963,19 +2115,35 @@ class LearningPathDataStore:
 
         if not paths:
             raise ValueError("저장할 학습경로가 없습니다.")
+        if int(generation_version) < 1:
+            raise ValueError("학습경로 생성 버전은 1 이상이어야 합니다.")
         if source_checkin_id is not None:
-            existing = self.get_learning_path_by_checkin(source_checkin_id)
-            if not existing.empty:
-                return str(existing.iloc[0]["analysis_batch_id"])
             if len(paths) != 1:
                 raise ValueError(
                     "학생 체크인에는 하나의 개인 학습경로만 연결할 수 있습니다."
                 )
+            existing_version = self.get_learning_path_version(
+                source_checkin_id,
+                generation_version,
+                connection=connection,
+            )
+            if not existing_version.empty:
+                if create_new_version:
+                    raise ValueError(
+                        f"이미 존재하는 학습경로 버전입니다: {generation_version}"
+                    )
+                return str(existing_version.iloc[0]["analysis_batch_id"])
+            if not create_new_version:
+                existing = self.get_learning_path_by_checkin(
+                    source_checkin_id, connection=connection
+                )
+                if not existing.empty:
+                    return str(existing.iloc[0]["analysis_batch_id"])
         batch_id = analysis_batch_id or uuid.uuid4().hex
         student_ids = [str(path["student_id"]) for path in paths]
         if len(student_ids) != len(set(student_ids)):
             raise ValueError("한 분석 배치에 학생별 경로는 하나만 저장할 수 있습니다.")
-        with _connect(self.database_path) as connection:
+        with database_transaction(self.database_path, connection) as connection:
             if source_checkin_id is not None:
                 checkin = connection.execute(
                     "SELECT student_id FROM student_checkins WHERE checkin_id = ?",
@@ -1994,14 +2162,16 @@ class LearningPathDataStore:
                     """
                     INSERT INTO learning_paths (
                         analysis_batch_id, student_id, source_checkin_id,
-                        path_name, related_job, competencies, reason,
-                        career_connection, provider_name, fallback_used
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        generation_version, path_name, related_job, competencies, reason,
+                        career_connection, provider_name, fallback_used,
+                        review_status, review_note, reviewed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         batch_id,
                         str(path["student_id"]),
                         source_checkin_id,
+                        int(generation_version),
                         str(path["path_name"]),
                         str(path.get("related_job", "")),
                         json.dumps(
@@ -2012,6 +2182,9 @@ class LearningPathDataStore:
                         str(path.get("career_connection", "")),
                         str(path.get("provider_name", "")),
                         int(bool(path.get("fallback_used", False))),
+                        str(path.get("review_status", "검토 대기")),
+                        str(path.get("review_note", "")),
+                        path.get("reviewed_at") or None,
                     ),
                 )
                 path_id = int(cursor.lastrowid)
@@ -2020,8 +2193,8 @@ class LearningPathDataStore:
                         """
                         INSERT INTO learning_path_courses (
                             path_id, course_id, sequence, score, reason,
-                            selection_reason
-                        ) VALUES (?, ?, ?, ?, ?, ?)
+                            selection_reason, review_judgment
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             path_id,
@@ -2030,6 +2203,7 @@ class LearningPathDataStore:
                             float(course["score"]),
                             str(course["reason"]),
                             str(course.get("selection_reason", "")),
+                            str(course.get("review_judgment", "판단 전")),
                         ),
                     )
             for candidate in candidates:
@@ -2074,29 +2248,79 @@ class LearningPathDataStore:
                         str(candidate["status"]),
                     ),
                 )
-            connection.commit()
         return batch_id
 
-    def get_learning_path_by_checkin(self, checkin_id: int) -> pd.DataFrame:
-        """학생 체크인에 연결된 저장 학습경로와 교과목 순서를 반환한다."""
+    def get_learning_path_by_checkin(
+        self,
+        checkin_id: int,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> pd.DataFrame:
+        """학생 체크인에 연결된 최신 버전 학습경로와 교과목 순서를 반환한다."""
 
-        with _connect(self.database_path) as connection:
+        return self._get_learning_path(checkin_id, connection=connection)
+
+    def get_learning_path_version(
+        self,
+        checkin_id: int,
+        generation_version: int,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> pd.DataFrame:
+        """학생 체크인의 지정 추천 버전 학습경로를 반환한다."""
+
+        return self._get_learning_path(
+            checkin_id, generation_version, connection=connection
+        )
+
+    def _get_learning_path(
+        self,
+        checkin_id: int,
+        generation_version: int | None = None,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> pd.DataFrame:
+        """체크인과 선택적 버전으로 개인 학습경로를 조회한다."""
+
+        version_filter = (
+            "AND p.generation_version = ?"
+            if generation_version is not None
+            else ""
+        )
+        parameters: tuple[Any, ...] = (
+            (int(checkin_id), int(generation_version), int(generation_version))
+            if generation_version is not None
+            else (int(checkin_id),)
+        )
+
+        with database_transaction(self.database_path, connection) as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT p.path_id, p.analysis_batch_id, p.student_id,
-                       p.source_checkin_id, p.path_name, p.related_job,
+                       p.source_checkin_id, p.generation_version,
+                       p.path_name, p.related_job,
                        p.competencies, p.reason AS path_reason,
                        p.career_connection, p.provider_name, p.fallback_used,
                        p.review_status, p.review_note, p.reviewed_at,
                        c.course_id, c.sequence, c.score,
                        c.reason AS course_role, c.selection_reason,
+                       c.review_judgment,
                        p.created_at
                 FROM learning_paths AS p
                 JOIN learning_path_courses AS c ON c.path_id = p.path_id
                 WHERE p.source_checkin_id = ?
+                  {version_filter}
+                  AND p.path_id = (
+                      SELECT latest.path_id
+                      FROM learning_paths AS latest
+                      WHERE latest.source_checkin_id = p.source_checkin_id
+                        {version_filter.replace('p.', 'latest.')}
+                      ORDER BY latest.generation_version DESC, latest.path_id DESC
+                      LIMIT 1
+                  )
                 ORDER BY c.sequence, c.course_id
                 """,
-                (int(checkin_id),),
+                parameters,
             ).fetchall()
         records: list[dict[str, Any]] = []
         for row in rows:
@@ -2115,6 +2339,7 @@ class LearningPathDataStore:
             rows = connection.execute(
                 """
                 SELECT p.path_id, p.analysis_batch_id, p.student_id,
+                       p.source_checkin_id, p.generation_version,
                        p.path_name, p.related_job, p.competencies,
                        c.course_id, c.sequence, c.score, c.reason,
                        p.created_at

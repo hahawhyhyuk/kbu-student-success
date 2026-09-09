@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.course_description_import_service import (
+    DEFAULT_COURSE_DESCRIPTION_FILE,
     DESCRIPTION_SOURCE,
     SafeCourseDescriptionFrame,
     build_course_description_enrichment,
@@ -243,3 +244,16 @@ def test_default_description_file_discovery_is_unicode_safe(
     result = find_default_course_description_file(tmp_path)
 
     assert result == expected
+
+
+def test_default_description_file_prefers_2026_2025_source(
+    tmp_path: Path,
+) -> None:
+    legacy = tmp_path / "강좌기본정보.xlsx"
+    preferred = tmp_path / DEFAULT_COURSE_DESCRIPTION_FILE
+    legacy.write_bytes(b"")
+    preferred.write_bytes(b"")
+
+    result = find_default_course_description_file(tmp_path)
+
+    assert result == preferred

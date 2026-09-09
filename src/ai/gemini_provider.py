@@ -188,9 +188,12 @@ class GeminiProvider(AIProvider):
         system_instruction: str | None = None,
         temperature: float = 0.1,
         operation_label: str = "구조화 응답 생성",
+        timeout_seconds: int | None = None,
+        max_output_tokens: int | None = None,
     ) -> dict[str, Any]:
         """Gemini structured-output REST 요청을 공통 처리한다."""
 
+        effective_timeout = int(timeout_seconds or self.timeout_seconds)
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
@@ -199,6 +202,10 @@ class GeminiProvider(AIProvider):
                 "temperature": temperature,
             },
         }
+        if max_output_tokens is not None:
+            payload["generationConfig"]["maxOutputTokens"] = int(
+                max_output_tokens
+            )
         if system_instruction:
             payload["systemInstruction"] = {
                 "parts": [{"text": str(system_instruction)}]
@@ -215,7 +222,7 @@ class GeminiProvider(AIProvider):
         )
         try:
             with urllib.request.urlopen(
-                request, timeout=self.timeout_seconds
+                request, timeout=effective_timeout
             ) as response:
                 response_payload = json.loads(response.read().decode("utf-8"))
             raw_text = response_payload["candidates"][0]["content"]["parts"][0][
@@ -226,16 +233,26 @@ class GeminiProvider(AIProvider):
             raise AIProviderError(
                 f"Gemini {operation_label}에 실패했습니다 (HTTP {error.code})."
             ) from error
-        except (
-            urllib.error.URLError,
-            TimeoutError,
-            json.JSONDecodeError,
-            KeyError,
-            IndexError,
-            TypeError,
-        ) as error:
+        except TimeoutError as error:
             raise AIProviderError(
-                f"Gemini {operation_label}에 실패했습니다."
+                f"Gemini {operation_label}에 실패했습니다 "
+                f"(시간 초과: {effective_timeout}초)."
+            ) from error
+        except urllib.error.URLError as error:
+            if isinstance(error.reason, TimeoutError):
+                detail = f"시간 초과: {effective_timeout}초"
+            else:
+                detail = "네트워크 연결 오류"
+            raise AIProviderError(
+                f"Gemini {operation_label}에 실패했습니다 ({detail})."
+            ) from error
+        except json.JSONDecodeError as error:
+            raise AIProviderError(
+                f"Gemini {operation_label}에 실패했습니다 (응답 JSON 해석 오류)."
+            ) from error
+        except (KeyError, IndexError, TypeError) as error:
+            raise AIProviderError(
+                f"Gemini {operation_label}에 실패했습니다 (응답 형식 누락)."
             ) from error
         if not isinstance(parsed, dict):
             raise AIProviderError("Gemini structured output이 JSON object가 아닙니다.")
@@ -345,6 +362,8 @@ class GeminiProvider(AIProvider):
             prompt,
             batch_schema,
             operation_label="교육과정 후보 설명",
+            timeout_seconds=max(self.timeout_seconds, 60),
+            max_output_tokens=8192,
         )
         raw_descriptions = parsed.get("candidates")
         if not isinstance(raw_descriptions, list):

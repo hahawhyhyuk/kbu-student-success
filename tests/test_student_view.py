@@ -544,27 +544,38 @@ def test_staff_pages_reuse_student_generated_results(
         button.label == "교과 학습경로 생성"
         for button in intervention_page.button
     )
-    intervention_page.pills[0].set_value("통합 승인").run(timeout=30)
-    integrated_action_labels = {
+    intervention_page.pills[0].set_value("최종 검토").run(timeout=30)
+    review_action_labels = {
         button.label for button in intervention_page.button
     }
     assert {
-        "통합 승인",
-        "조정 필요로 저장",
-        "검토 보류",
-    }.issubset(integrated_action_labels)
-    assert any(
-        "추천을 자동으로 다시 생성하지는 않습니다" in str(item.value)
-        for item in intervention_page.caption
-    )
+        "검토 결과 저장",
+        "전체 보류",
+    }.issubset(review_action_labels)
+    next(
+        item for item in intervention_page.radio if item.label == "비교과 판단"
+    ).set_value("승인").run(timeout=30)
+    next(
+        item for item in intervention_page.radio if item.label == "교과 판단"
+    ).set_value("승인").run(timeout=30)
+    judgment_labels = [
+        item.label
+        for item in intervention_page.selectbox
+        if item.label.endswith(" 적절성")
+    ]
+    assert len(judgment_labels) == 4
+    for label in judgment_labels:
+        next(
+            item for item in intervention_page.selectbox if item.label == label
+        ).set_value("적절").run(timeout=30)
     next(
         button
         for button in intervention_page.button
-        if button.label == "통합 승인"
+        if button.label == "검토 결과 저장"
     ).click().run(timeout=30)
     assert not intervention_page.exception
     assert any(
-        "비교과 추천과 교과 학습경로" in item.value
+        "비교과와 교과의 독립 검토" in item.value
         for item in intervention_page.success
     )
     interventions = InterventionDataStore(database_path).list_interventions()
@@ -574,6 +585,257 @@ def test_staff_pages_reuse_student_generated_results(
         result.checkin_id
     )
     assert path["review_status"].unique().tolist() == ["승인"]
+
+
+def test_adjusted_recommendations_are_regenerated_as_a_new_version(
+    tmp_path: Path,
+) -> None:
+    """선택 제외 재추천은 이전 비교과·교과 버전을 보존한다."""
+
+    database_path = tmp_path / "regenerated-recommendations.db"
+    service = _student_service(database_path)
+    original = service.submit_checkin("S0003", STUDENT_VALUES)
+    assert original.learning_path_result is not None
+    service.intervention_service.apply_integrated_review_action(
+        original.intervention_context.intervention_id,
+        "수정",
+        "선택한 비교과와 교과목을 제외해 재추천",
+    )
+
+    excluded_program_id = (
+        original.recommendation_result.recommendations[0].program_id
+    )
+    excluded_course_id = (
+        original.learning_path_result.selection.courses[0].course_id
+    )
+    regenerated = service.regenerate_recommendations(
+        "S0003",
+        original.profile,
+        original.analysis_result.analysis,
+        service.repository.get_all(),
+        excluded_program_ids=[excluded_program_id],
+        excluded_course_ids=[excluded_course_id],
+    )
+
+    assert regenerated.intervention_context.generation_version == 2
+    assert regenerated.learning_path_result is not None
+    assert regenerated.learning_path_error is None
+    assert not regenerated.program_recommendations_preserved
+    assert not regenerated.learning_path_preserved
+    assert excluded_program_id not in {
+        item.program_id
+        for item in regenerated.recommendation_result.recommendations
+    }
+    assert excluded_course_id not in {
+        item.course_id
+        for item in regenerated.learning_path_result.selection.courses
+    }
+
+    path_store = LearningPathDataStore(database_path)
+    version_one = path_store.get_learning_path_version(original.checkin_id, 1)
+    version_two = path_store.get_learning_path_version(original.checkin_id, 2)
+    assert not version_one.empty
+    assert not version_two.empty
+    assert excluded_course_id in set(version_one["course_id"].astype(str))
+    assert excluded_course_id not in set(version_two["course_id"].astype(str))
+    assert version_one["review_status"].unique().tolist() == ["조정 필요"]
+    assert version_two["review_status"].unique().tolist() == ["검토 대기"]
+
+    service.intervention_service.apply_integrated_review_action(
+        regenerated.intervention_context.intervention_id,
+        "승인",
+        "새 버전의 비교과·교과 확인",
+    )
+    version_one_after_review = path_store.get_learning_path_version(
+        original.checkin_id, 1
+    )
+    version_two_after_review = path_store.get_learning_path_version(
+        original.checkin_id, 2
+    )
+    assert version_one_after_review["review_status"].unique().tolist() == [
+        "조정 필요"
+    ]
+    assert version_two_after_review["review_status"].unique().tolist() == ["승인"]
+
+    latest_context = StudentViewQueryService(
+        database_path
+    ).get_staff_student_context("S0003")
+    assert latest_context.intervention is not None
+    assert latest_context.intervention["generation_version"] == 2
+    assert latest_context.learning_path["generation_version"].unique().tolist() == [2]
+
+
+def test_course_only_adjustment_can_regenerate_the_learning_path(
+    tmp_path: Path,
+) -> None:
+    """비교과 승인 상태를 유지하면서 교과 조정 요청만으로 과목을 교체한다."""
+
+    database_path = tmp_path / "course-only-regeneration.db"
+    service = _student_service(database_path)
+    original = service.submit_checkin("S0003", STUDENT_VALUES)
+    assert original.learning_path_result is not None
+    course_ids = [
+        course.course_id
+        for course in original.learning_path_result.selection.courses
+    ]
+    excluded_course_id = course_ids[0]
+    service.intervention_service.apply_separate_review_actions(
+        intervention_id=original.intervention_context.intervention_id,
+        program_decision="승인",
+        program_note="비교과 추천은 유지",
+        course_decision="조정 필요",
+        course_note="첫 번째 교과목을 다른 후보로 교체",
+        course_judgments={
+            course_id: (
+                "부적절" if course_id == excluded_course_id else "적절"
+            )
+            for course_id in course_ids
+        },
+    )
+
+    regenerated = service.regenerate_recommendations(
+        "S0003",
+        original.profile,
+        original.analysis_result.analysis,
+        service.repository.get_all(),
+        excluded_course_ids=[excluded_course_id],
+    )
+
+    assert regenerated.intervention_context.generation_version == 2
+    assert regenerated.learning_path_result is not None
+    assert regenerated.program_recommendations_preserved
+    assert not regenerated.learning_path_preserved
+    preserved_program_review = InterventionDataStore(
+        database_path
+    ).get_intervention(regenerated.intervention_context.intervention_id)
+    assert preserved_program_review is not None
+    assert preserved_program_review["staff_action"] == "추천 검토 승인"
+    assert preserved_program_review["staff_note"] == "비교과 추천은 유지"
+    assert excluded_course_id not in {
+        course.course_id
+        for course in regenerated.learning_path_result.selection.courses
+    }
+
+
+def test_regeneration_requires_adjustment_and_an_explicit_exclusion(
+    tmp_path: Path,
+) -> None:
+    """메모만으로 추천을 바꾸지 않고 명시적 조정 절차를 강제한다."""
+
+    service = _student_service(tmp_path / "regeneration-guard.db")
+    original = service.submit_checkin("S0003", STUDENT_VALUES)
+    source = service.repository.get_all()
+
+    with pytest.raises(ValueError, match="조정 필요"):
+        service.regenerate_recommendations(
+            "S0003",
+            original.profile,
+            original.analysis_result.analysis,
+            source,
+            excluded_program_ids=[
+                original.recommendation_result.recommendations[0].program_id
+            ],
+        )
+
+    service.intervention_service.apply_integrated_review_action(
+        original.intervention_context.intervention_id,
+        "수정",
+        "재추천 테스트",
+    )
+    with pytest.raises(ValueError, match="하나 이상"):
+        service.regenerate_recommendations(
+            "S0003",
+            original.profile,
+            original.analysis_result.analysis,
+            source,
+        )
+
+
+def test_integrated_review_ui_creates_a_versioned_recommendation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """통합 검토 UI에서 조정 항목을 명시해 새 버전을 만든다."""
+
+    database_path = tmp_path / "regeneration-ui.db"
+    monkeypatch.setattr("src.database.DEFAULT_DATABASE_PATH", database_path)
+    original = _student_service(database_path).submit_checkin(
+        "S0003", STUDENT_VALUES
+    )
+    excluded_program_id = (
+        original.recommendation_result.recommendations[0].program_id
+    )
+
+    page = AppTest.from_file(
+        str(PROJECT_ROOT / "pages" / "03_ai_intervention.py")
+    )
+    page.session_state["demo_student_id"] = "S0003"
+    page.run(timeout=60)
+    page.pills[0].set_value("최종 검토").run(timeout=60)
+    next(
+        item for item in page.radio if item.label == "비교과 판단"
+    ).set_value("조정 필요").run(timeout=60)
+    next(
+        item for item in page.radio if item.label == "교과 판단"
+    ).set_value("승인").run(timeout=60)
+    judgment_labels = [
+        item.label for item in page.selectbox if item.label.endswith(" 적절성")
+    ]
+    for label in judgment_labels:
+        next(
+            item for item in page.selectbox if item.label == label
+        ).set_value("적절").run(timeout=60)
+    next(
+        item for item in page.text_area if item.label == "비교과 검토 메모"
+    ).set_value("첫 번째 비교과를 다른 후보로 교체해 주세요.").run(
+        timeout=60
+    )
+    next(
+        button
+        for button in page.button
+        if button.label == "검토 결과 저장"
+    ).click().run(timeout=60)
+
+    assert not page.exception
+    assert any(
+        "추천 다시 만들기" in str(item.value) for item in page.markdown
+    )
+    replace_programs = next(
+        item
+        for item in page.multiselect
+        if item.label == "교체할 비교과 추천"
+    )
+    replace_programs.set_value([excluded_program_id]).run(timeout=60)
+    next(
+        button
+        for button in page.button
+        if button.label == "선택 항목 제외하고 추천 다시 만들기"
+    ).click().run(timeout=60)
+
+    assert not page.exception
+    latest = InterventionDataStore(database_path).get_intervention_by_checkin(
+        original.checkin_id
+    )
+    assert latest is not None
+    assert latest["generation_version"] == 2
+    new_rows = InterventionDataStore(database_path).list_recommendations(
+        str(latest["recommendation_batch_id"])
+    )
+    assert excluded_program_id not in set(new_rows["target_id"].astype(str))
+    preserved_path = LearningPathDataStore(database_path).get_learning_path_version(
+        original.checkin_id,
+        2,
+    )
+    assert preserved_path["review_status"].unique().tolist() == ["승인"]
+    assert preserved_path["review_judgment"].unique().tolist() == ["적절"]
+    assert any(
+        "v2 추천을 저장했습니다" in str(item.value)
+        for item in page.success
+    )
+    assert any(
+        "교과 결과는 그대로 유지했습니다" in str(item.value)
+        for item in page.success
+    )
 
 
 def test_integrated_review_refreshes_only_stale_program_recommendations(
@@ -766,6 +1028,52 @@ def test_student_checkin_uses_free_kare_chat_and_keeps_structured_values(
     assert draft["desired_job"] == "서비스 기획"
     assert "과제가 밀리고" in draft["natural_language_concern"]
     assert draft["response_mode"] == "narrative"
+
+    history_key = "student_checkin_S0001_conversation_history"
+    mode_key = "student_checkin_S0001_conversation_mode"
+    preview_key = "student_checkin_S0001_analysis_preview"
+    history_before_edit = list(page.session_state[history_key])
+    next(
+        button
+        for button in page.button
+        if button.label == "조금 수정할게요"
+    ).click().run(timeout=30)
+
+    assert not page.exception
+    assert page.session_state[mode_key] == "edit"
+    assert page.session_state[history_key] == history_before_edit
+    assert preview_key in page.session_state
+    assert page.text_area[0].value == draft["natural_language_concern"]
+    page.text_input[0].set_value("데이터 분석가").run(timeout=30)
+    next(
+        button
+        for button in page.button
+        if button.label == "수정 내용을 반영하고 다시 확인"
+    ).click().run(timeout=30)
+
+    assert not page.exception
+    assert page.session_state[mode_key] == "review"
+    assert page.session_state[history_key] == history_before_edit
+    assert page.session_state["student_checkin_S0001_draft"]["desired_job"] == (
+        "데이터 분석가"
+    )
+    assert preview_key in page.session_state
+
+    next(
+        button
+        for button in page.button
+        if button.label == "다시 이야기할게요"
+    ).click().run(timeout=30)
+
+    assert not page.exception
+    assert page.session_state[mode_key] == "conversation"
+    assert page.session_state[history_key][:-1] == history_before_edit
+    assert "그대로 두고 이어서" in page.session_state[history_key][-1]["content"]
+    assert page.session_state["student_checkin_S0001_draft"]["desired_job"] == (
+        "데이터 분석가"
+    )
+    assert preview_key not in page.session_state
+    assert len(page.chat_input) == 1
 
 
 def test_external_ai_consent_survives_multiple_chat_reruns(

@@ -7,7 +7,11 @@ from src.ai import AIProvider, MockAIProvider, ResilientAIProvider
 from src.ai.schema import validate_learning_path_explanation
 from src.course_recommender import CourseRecommender
 from src.data_generator import generate_courses
-from src.learning_path_builder import LearningPathBuilder
+from src.learning_path_builder import (
+    LearningPathBuilder,
+    ordered_courses_by_sequence,
+)
+from src.recommendation_interest import infer_interest_evidence
 from src.similarity import TokenOverlapSimilarityBackend
 
 
@@ -74,7 +78,7 @@ def test_course_path_has_three_to_four_unique_existing_courses() -> None:
         for course in result.courses
     )
     assert all(
-        "학생 서술과 과목 정보 유사도" in course.reason
+        "대화·과목 정보 의미 유사도 참고값" in course.reason
         for course in result.courses
     )
 
@@ -179,6 +183,29 @@ def test_mock_learning_path_keeps_selected_database_ids() -> None:
     assert result.provider_name == "mock"
 
 
+def test_learning_path_cards_follow_explanation_sequence() -> None:
+    """카드 출력은 추천기 배열이 아니라 검증된 권장 순서를 따른다."""
+
+    selection = _selection()
+    reversed_courses = tuple(reversed(selection.courses))
+    explanation = {
+        "course_roles": [
+            {
+                "course_id": course.course_id,
+                "role": "테스트 역할",
+                "sequence": sequence,
+            }
+            for sequence, course in enumerate(reversed_courses, start=1)
+        ]
+    }
+
+    ordered = ordered_courses_by_sequence(selection, explanation)
+
+    assert [course.course_id for course in ordered] == [
+        course.course_id for course in reversed_courses
+    ]
+
+
 def test_invalid_primary_path_explanation_falls_back_to_mock() -> None:
     selection = _selection()
     provider = ResilientAIProvider(InvalidPathProvider(), MockAIProvider())
@@ -266,3 +293,128 @@ def test_actual_offerings_use_source_fields_without_inventing_tags() -> None:
     assert result.warning is not None
     assert "강의계획서" in result.warning
     assert all(course.source_course_id == course.course_id for course in result.courses)
+
+
+def test_source_backed_path_keeps_cross_department_limit_when_home_courses_exist() -> None:
+    rows = []
+    specifications = (
+        ("HOME01", "간호기초실습", "간호학과", "기초 간호 술기를 익힙니다."),
+        ("HOME02", "건강사정", "간호학과", "대상자의 건강 상태를 사정합니다."),
+        ("CROSS01", "데이터서비스기획", "소프트웨어융합과", "데이터 AI 서비스 운영 기획"),
+        ("CROSS02", "AI서비스개발", "소프트웨어융합과", "데이터 AI 서비스 운영 개발"),
+        ("CROSS03", "디지털서비스운영", "경영학과", "데이터 AI 서비스 운영 관리"),
+        ("CROSS04", "서비스분석", "경영학과", "데이터 AI 서비스 운영 분석"),
+    )
+    for course_id, name, department, description in specifications:
+        rows.append(
+            {
+                "course_id": course_id,
+                "course_name": name,
+                "department": department,
+                "description": description,
+                "learning_objectives": "",
+                "competencies": "",
+                "related_jobs": "",
+                "related_interests": "",
+                "grade_level": 1,
+                "semester": 1,
+                "difficulty": "원본 미제공",
+                "prerequisites": "",
+                "credit": 3,
+                "is_available": True,
+                "catalog_source": "actual_course_offerings_2026",
+                "source_course_id": course_id,
+                "offering_departments": department,
+                "offered_semesters": "1",
+                "grade_levels": "1",
+                "course_area": "전공",
+                "class_method": "대면",
+                "course_type": "일반교과",
+                "ncs_type": "NCS",
+                "cross_department_status": "allowed",
+                "recommendation_basis": "교과목명·개설학과·NCS",
+                "completion_data_status": "미연결",
+                "registration_check_required": True,
+            }
+        )
+    config = {
+        "course_recommendation": {
+            "top_k": 4,
+            "minimum_courses": 3,
+            "minimum_interest_aligned_courses": 2,
+            "candidate_pool_size": 4,
+            "diversity_bonus": 0.0,
+            "department_policy": {
+                "allow_cross_department": True,
+                "home_department_bonus": 0.0,
+                "minimum_home_department_courses": 1,
+            },
+            "source_backed_policy": {
+                "home_department_bonus": 0.0,
+                "candidate_pool_size": 4,
+                "maximum_cross_department_courses": 2,
+                "max_general_education_courses": 1,
+                "max_same_name_family": 1,
+            },
+            "weights": {
+                "semantic_similarity": 0.4,
+                "interest_match": 0.2,
+                "job_match": 0.15,
+                "competency_coverage": 0.15,
+                "feasibility": 0.1,
+            },
+        }
+    }
+    profile = {
+        **PROFILE,
+        "department": "간호학과",
+        "interest_fields": "데이터·AI",
+        "desired_job": "서비스 운영",
+        "natural_language_concern": "데이터 AI 서비스 운영을 배우고 싶어요.",
+    }
+
+    result = CourseRecommender(
+        similarity_backend=TokenOverlapSimilarityBackend(),
+        config=config,
+    ).recommend(
+        profile=profile,
+        analysis={
+            **ANALYSIS,
+            "interests": ["데이터·AI"],
+            "desired_jobs": ["서비스 운영"],
+            "summary": "데이터 AI 서비스 운영을 배우고 싶음",
+        },
+        courses=pd.DataFrame(rows),
+        completed_course_ids=set(),
+    )
+
+    assert len(result.courses) == 4
+    assert sum(not course.is_home_department for course in result.courses) == 2
+    assert sum(course.is_home_department for course in result.courses) == 2
+    assert sum(
+        "관심분야 직접 연결:" in course.reason
+        and "데이터·AI" in course.reason
+        for course in result.courses
+    ) >= 2
+
+
+@pytest.mark.parametrize(
+    "interest,text",
+    [
+        ("데이터·AI", "파이썬으로 데이터를 분석하고 시각화하는 수업"),
+        ("경영·마케팅", "소비자 시장과 브랜드 마케팅을 배우는 수업"),
+        ("콘텐츠·디자인", "영상 편집과 그래픽 디자인 프로젝트"),
+        ("서비스", "고객경험을 중심으로 서비스기획을 실습"),
+        ("보건", "환자 간호와 임상 보건을 배우는 수업"),
+        ("상담·복지", "심리 상담과 사례관리 실습"),
+    ],
+)
+def test_runtime_interest_inference_supports_every_student_interest(
+    interest: str, text: str
+) -> None:
+    """원본 master에 태그가 없어도 6개 관심 분야를 동일한 방식으로 판별한다."""
+
+    evidence = infer_interest_evidence(text, {interest})
+
+    assert interest in evidence
+    assert evidence[interest]

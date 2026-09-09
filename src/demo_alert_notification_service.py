@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import sqlite3
 from typing import Any, Iterable, Mapping
 
 from src.database import DemoAlertNotificationDataStore
@@ -223,6 +224,8 @@ class DemoAlertNotificationService:
         self,
         student_id: str,
         checkin_id: int,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> DemoAlertNotification | None:
         """학생 체크인 저장이 성공한 뒤 안내 흐름을 완료 상태로 연결한다."""
 
@@ -231,5 +234,6 @@ class DemoAlertNotificationService:
                 student_id,
                 STATUS_CHECKIN_COMPLETED,
                 checkin_id=int(checkin_id),
+                connection=connection,
             )
         )

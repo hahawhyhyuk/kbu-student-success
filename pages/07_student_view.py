@@ -37,6 +37,7 @@ from src.demo_alert_notification_service import (
     DemoAlertNotificationService,
 )
 from src.intervention_recommender import InterventionRecommender
+from src.learning_path_builder import ordered_courses_by_sequence
 from src.repositories import get_default_repository
 from src.student_view_service import (
     ANALYSIS_FEEDBACK_TYPES,
@@ -655,6 +656,47 @@ def merge_analysis_into_draft(
     return merged
 
 
+def create_checkin_preview(
+    values: dict[str, object],
+    *,
+    input_mode: str,
+    external_ai_consent: bool,
+) -> tuple[dict[str, object], CheckinAnalysisResult]:
+    """현재 초안의 확인용 분석만 갱신하고 새 체크인은 만들지 않는다.
+
+    Parameters:
+        values: 학생이 대화하거나 직접 수정한 현재 브라우저의 임시 초안.
+        input_mode: AI 대화 또는 외부 전송 없는 직접 입력 구분.
+        external_ai_consent: 현재 Gemini 전송 동의 상태.
+
+    Returns:
+        검증된 현재 초안과 저장 전 확인에만 쓰는 AI 분석 결과.
+
+    Assumptions:
+        실제 DB 저장은 학생이 별도의 제출 버튼을 누를 때만 수행한다.
+    """
+
+    checked_values = validate_narrative_values(values)
+    allow_external_ai = input_mode == "ai_chat" and external_ai_consent
+    preview_result = get_student_service(
+        allow_external_ai=allow_external_ai
+    ).preview_checkin_analysis(checked_values["natural_language_concern"])
+    if not allow_external_ai:
+        preview_result = CheckinAnalysisResult(
+            analysis=preview_result.analysis,
+            provider_name=preview_result.provider_name,
+            fallback_used=True,
+            warning="외부 AI로 전송하지 않고 로컬 규칙으로 내용을 정리했습니다.",
+        )
+    checked_values = validate_narrative_values(
+        merge_analysis_into_draft(
+            checked_values,
+            preview_result.analysis,
+        )
+    )
+    return checked_values, preview_result
+
+
 def process_kare_message(
     *,
     message: str,
@@ -1180,30 +1222,11 @@ elif conversation_mode == "preview":
                 key=student_checkin_key(selected_student_id, "generate_preview"),
             ):
                 try:
-                    checked_values = validate_narrative_values(draft_values)
                     with st.spinner("Kare가 대화 내용을 정리하고 있어요..."):
-                        allow_external_ai = (
-                            input_mode == "ai_chat" and external_ai_consent
-                        )
-                        preview_result = get_student_service(
-                            allow_external_ai=allow_external_ai
-                        ).preview_checkin_analysis(
-                            checked_values["natural_language_concern"]
-                        )
-                        if not allow_external_ai:
-                            preview_result = CheckinAnalysisResult(
-                                analysis=preview_result.analysis,
-                                provider_name=preview_result.provider_name,
-                                fallback_used=True,
-                                warning=(
-                                    "외부 AI로 전송하지 않고 로컬 규칙으로 내용을 정리했습니다."
-                                ),
-                            )
-                        checked_values = validate_narrative_values(
-                            merge_analysis_into_draft(
-                                checked_values,
-                                preview_result.analysis,
-                            )
+                        checked_values, preview_result = create_checkin_preview(
+                            draft_values,
+                            input_mode=input_mode,
+                            external_ai_consent=external_ai_consent,
                         )
                         st.session_state[draft_key] = checked_values
                         st.session_state[preview_key] = preview_result
@@ -1277,14 +1300,26 @@ elif conversation_mode == "review":
                 width="stretch",
                 key=student_checkin_key(selected_student_id, "review_restart"),
             ):
-                reset_kare_conversation(
-                    selected_student_id, conversation_state_keys
-                )
+                # 검토 결과만 오래된 상태가 되므로 버리고, 대화와 초안은 유지한다.
+                st.session_state.pop(preview_key, None)
+                if input_mode == "ai_chat":
+                    append_kare_message(
+                        history_key,
+                        "assistant",
+                        "좋아요. 지금까지 나눈 이야기는 그대로 두고 이어서 들을게요.",
+                    )
+                    st.session_state[mode_key] = "conversation"
+                else:
+                    st.session_state[mode_key] = "direct"
+                st.rerun()
 
 elif conversation_mode == "edit":
     with st.container(key=f"kare_chat_shell_{selected_student_id}"):
         with st.chat_message("assistant", avatar="✨"):
-            st.write("물론이에요. 바꾸고 싶은 내용을 수정한 뒤 다시 확인해 주세요.")
+            st.markdown("### 현재 체크인 내용 수정")
+            st.write(
+                "지금까지의 대화는 유지돼요. 바꾸고 싶은 내용만 고친 뒤 다시 확인해 주세요."
+            )
         with st.form(f"kare_edit_form_{selected_student_id}"):
             edit_concern = st.text_area(
                 "나의 이야기",
@@ -1357,6 +1392,13 @@ elif conversation_mode == "edit":
                 type="primary",
                 width="stretch",
             )
+        if st.button(
+            "수정 취소하고 확인으로 돌아가기",
+            type="tertiary",
+            key=student_checkin_key(selected_student_id, "cancel_edit"),
+        ):
+            st.session_state[mode_key] = "review"
+            st.rerun()
         if edit_submitted:
             for field, response in edit_scale_responses.items():
                 draft_values[field] = scale_score(field, response)
@@ -1398,17 +1440,26 @@ elif conversation_mode == "edit":
                     "semantic_states": updated_semantic_states,
                 }
             )
-            st.session_state[draft_key] = validate_narrative_values(
-                draft_values
-            )
-            st.session_state.pop(preview_key, None)
-            st.session_state[mode_key] = "preview"
-            append_kare_message(
-                history_key,
-                "assistant",
-                "수정한 내용을 반영했어요. AI 이해 결과를 다시 확인해 주세요.",
-            )
-            st.rerun()
+            try:
+                # 분석 재호출이 실패해도 학생이 수정한 초안 자체는 보존한다.
+                st.session_state[draft_key] = validate_narrative_values(
+                    draft_values
+                )
+                with st.spinner("수정한 내용을 다시 정리하고 있어요..."):
+                    checked_values, preview_result = create_checkin_preview(
+                        dict(st.session_state[draft_key]),
+                        input_mode=input_mode,
+                        external_ai_consent=external_ai_consent,
+                    )
+                st.session_state[draft_key] = checked_values
+                st.session_state[preview_key] = preview_result
+                st.session_state[mode_key] = "review"
+                st.rerun()
+            except Exception as error:
+                st.error(
+                    "수정 내용을 다시 정리하지 못했습니다. 입력은 유지되어 있으니 "
+                    f"잠시 후 다시 시도해 주세요. ({error})"
+                )
 
 else:
     with st.container(key=f"kare_chat_shell_{selected_student_id}"):
@@ -1453,7 +1504,10 @@ if submitted:
             "아래에서 같은 결과를 확인해 주세요."
         )
     except Exception as error:
-        st.error(f"체크인을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요. ({error})")
+        st.error(
+            "체크인과 맞춤 결과를 저장하지 못했습니다. 입력 내용은 이 화면에 "
+            f"유지되어 있으니 잠시 후 다시 제출해 주세요. ({error})"
+        )
 
 stored_result: StudentJourneyResult | None = st.session_state.get(result_key)
 if stored_result is None:
@@ -1640,7 +1694,9 @@ else:
         str(item["course_id"]): item for item in explanation["course_roles"]
     }
     course_master_ids = set(courses["course_id"].astype(str))
-    for course in learning_path.selection.courses:
+    for course in ordered_courses_by_sequence(
+        learning_path.selection, explanation
+    ):
         if course.course_id not in course_master_ids:
             continue
         role = roles[course.course_id]

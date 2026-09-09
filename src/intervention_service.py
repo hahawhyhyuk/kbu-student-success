@@ -5,11 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+import sqlite3
 from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
-from src.database import InterventionDataStore
+from src.database import (
+    InterventionDataStore,
+    LearningPathDataStore,
+    database_transaction,
+)
 from src.intervention_recommender import ProgramRecommendation
 from src.utils import load_app_config
 
@@ -24,6 +29,17 @@ LEARNING_PATH_REVIEW_ACTIONS: dict[str, str] = {
     "수정": "조정 필요",
     "보류": "보류",
 }
+REVIEW_DECISION_ACTIONS: dict[str, str] = {
+    "승인": "승인",
+    "조정 필요": "수정",
+    "보류": "보류",
+}
+COURSE_REVIEW_JUDGMENTS: tuple[str, ...] = (
+    "판단 전",
+    "적절",
+    "보조적으로 적절",
+    "부적절",
+)
 
 
 @dataclass(frozen=True)
@@ -77,6 +93,8 @@ class InterventionManagementService:
         source_checkin_id: int | None = None,
         initial_status: str = "추천 생성",
         create_new_version: bool = False,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> InterventionContext:
         """검증된 프로그램 추천과 최초 개입 상태를 함께 기록한다.
 
@@ -87,6 +105,7 @@ class InterventionManagementService:
             source_checkin_id: 학생 제출 체크인과 결과를 연결하는 선택적 ID.
             initial_status: 생성 직후 개입 상태.
             create_new_version: 같은 체크인에 명시적인 새 버전을 만들지 여부.
+            connection: 학생 제출 등 상위 저장 작업과 함께 확정할 선택적 연결.
 
         Returns:
             이후 상태·피드백 저장에 필요한 SQLite 식별자.
@@ -103,12 +122,14 @@ class InterventionManagementService:
         if len(program_ids) != len(set(program_ids)):
             raise ValueError("중복 프로그램 추천은 저장할 수 없습니다.")
         existing = (
-            self.store.get_intervention_by_checkin(source_checkin_id)
+            self.store.get_intervention_by_checkin(
+                source_checkin_id, connection=connection
+            )
             if source_checkin_id is not None
             else None
         )
         if existing is not None and not create_new_version:
-            return self._context_from_intervention(existing)
+            return self._context_from_intervention(existing, connection=connection)
         generation_version = (
             int(existing.get("generation_version") or 1) + 1
             if existing is not None
@@ -131,24 +152,29 @@ class InterventionManagementService:
             }
             for rank, recommendation in enumerate(recommendations, start=1)
         ]
-        batch_id, recommendation_ids = self.store.save_recommendation_batch(
-            student_id=student_id,
-            recommendations=records,
-        )
-        risk_snapshot_id = (
-            self.store.save_risk_snapshot(student_id, risk_snapshot)
-            if risk_snapshot is not None
-            else None
-        )
-        intervention_id = self.store.create_intervention(
-            student_id=student_id,
-            recommendation_batch_id=batch_id,
-            recommended_program_ids=program_ids,
-            risk_snapshot_id=risk_snapshot_id,
-            source_checkin_id=source_checkin_id,
-            generation_version=generation_version,
-            initial_status=initial_status,
-        )
+        with database_transaction(self.store.database_path, connection) as connection:
+            batch_id, recommendation_ids = self.store.save_recommendation_batch(
+                student_id=student_id,
+                recommendations=records,
+                connection=connection,
+            )
+            risk_snapshot_id = (
+                self.store.save_risk_snapshot(
+                    student_id, risk_snapshot, connection=connection
+                )
+                if risk_snapshot is not None
+                else None
+            )
+            intervention_id = self.store.create_intervention(
+                student_id=student_id,
+                recommendation_batch_id=batch_id,
+                recommended_program_ids=program_ids,
+                risk_snapshot_id=risk_snapshot_id,
+                source_checkin_id=source_checkin_id,
+                generation_version=generation_version,
+                initial_status=initial_status,
+                connection=connection,
+            )
         return InterventionContext(
             intervention_id=intervention_id,
             batch_id=batch_id,
@@ -159,14 +185,19 @@ class InterventionManagementService:
         )
 
     def _context_from_intervention(
-        self, intervention: Mapping[str, Any]
+        self,
+        intervention: Mapping[str, Any],
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> InterventionContext:
         """저장된 개입 행과 추천 배치를 서비스 context로 복원한다."""
 
         batch_id = str(intervention.get("recommendation_batch_id") or "")
         if not batch_id:
             raise ValueError("저장된 개입에 추천 배치가 연결되어 있지 않습니다.")
-        recommendations = self.store.list_recommendations(batch_id)
+        recommendations = self.store.list_recommendations(
+            batch_id, connection=connection
+        )
         recommendation_ids = {
             str(row["target_id"]): int(row["recommendation_id"])
             for row in recommendations.to_dict(orient="records")
@@ -237,6 +268,111 @@ class InterventionManagementService:
             staff_action=staff_action,
             staff_note=staff_note,
             learning_path_status=LEARNING_PATH_REVIEW_ACTIONS[action],
+        )
+
+    def apply_separate_review_actions(
+        self,
+        intervention_id: int,
+        program_decision: str,
+        program_note: str = "",
+        course_decision: str | None = None,
+        course_note: str = "",
+        course_judgments: Mapping[str, str] | None = None,
+    ) -> bool:
+        """비교과와 교과를 독립 판정한 뒤 한 번에 저장한다.
+
+        Parameters:
+            intervention_id: 현재 추천 버전의 지원 ID.
+            program_decision: 비교과의 승인·조정 필요·보류 판단.
+            program_note: 비교과 검토 메모.
+            course_decision: 교과 경로의 독립 판단. 경로가 없으면 ``None``.
+            course_note: 교과 경로 검토 메모.
+            course_judgments: 경로 과목별 적절성 판정.
+
+        Returns:
+            교과 학습경로까지 저장했는지 여부.
+
+        Assumptions:
+            과목별 판정은 추천 순위에 자동 반영하지 않으며, 조정 요청 후
+            별도의 명시적 제외·재추천 단계에서만 후보를 변경한다.
+        """
+
+        if program_decision not in REVIEW_DECISION_ACTIONS:
+            raise ValueError(
+                f"지원하지 않는 비교과 검토 판단입니다: {program_decision}"
+            )
+        if course_decision is not None and course_decision not in (
+            REVIEW_DECISION_ACTIONS
+        ):
+            raise ValueError(
+                f"지원하지 않는 교과 검토 판단입니다: {course_decision}"
+            )
+        normalized_program_note = str(program_note).strip()
+        normalized_course_note = str(course_note).strip()
+        if program_decision == "조정 필요" and not normalized_program_note:
+            raise ValueError("비교과 조정 대상과 이유를 메모에 적어주세요.")
+        if course_decision == "조정 필요" and not normalized_course_note:
+            raise ValueError("교과 조정 대상과 이유를 메모에 적어주세요.")
+
+        normalized_judgments = {
+            str(course_id): str(judgment)
+            for course_id, judgment in (course_judgments or {}).items()
+        }
+        invalid_judgments = {
+            judgment
+            for judgment in normalized_judgments.values()
+            if judgment not in COURSE_REVIEW_JUDGMENTS
+        }
+        if invalid_judgments:
+            raise ValueError("지원하지 않는 교과목 적절성 판정입니다.")
+
+        intervention = self.store.get_intervention(intervention_id)
+        if intervention is None:
+            raise ValueError(f"존재하지 않는 개입 ID입니다: {intervention_id}")
+        source_checkin_id = intervention.get("source_checkin_id")
+        generation_version = int(intervention.get("generation_version") or 1)
+        path = pd.DataFrame()
+        if source_checkin_id is not None:
+            path = LearningPathDataStore(
+                self.store.database_path
+            ).get_learning_path_version(
+                int(source_checkin_id),
+                generation_version,
+            )
+        if path.empty:
+            if course_decision is not None or normalized_judgments:
+                raise ValueError("검토할 교과 학습경로가 없습니다.")
+        else:
+            if course_decision is None:
+                raise ValueError("교과 학습경로의 검토 판단을 선택해 주세요.")
+            current_course_ids = set(path["course_id"].astype(str))
+            if set(normalized_judgments) != current_course_ids:
+                raise ValueError("모든 추천 교과목의 적절성을 판정해 주세요.")
+            if course_decision == "승인" and any(
+                judgment in {"판단 전", "부적절"}
+                for judgment in normalized_judgments.values()
+            ):
+                raise ValueError(
+                    "교과 승인 전 모든 과목을 적절 또는 보조적으로 적절로 판정해 주세요."
+                )
+
+        program_action = REVIEW_DECISION_ACTIONS[program_decision]
+        intervention_status, program_staff_action = REVIEW_ACTIONS[program_action]
+        learning_path_status = (
+            LEARNING_PATH_REVIEW_ACTIONS[
+                REVIEW_DECISION_ACTIONS[course_decision]
+            ]
+            if course_decision is not None
+            else None
+        )
+        return self.store.update_separate_recommendation_review(
+            intervention_id=intervention_id,
+            intervention_status=intervention_status,
+            program_staff_action=program_staff_action,
+            program_note=normalized_program_note,
+            learning_path_status=learning_path_status,
+            learning_path_note=normalized_course_note,
+            course_judgments=normalized_judgments,
         )
 
     def update_status(
